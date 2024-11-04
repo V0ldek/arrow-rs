@@ -120,3 +120,5 @@
 pub mod page;
 pub mod reader;
 pub mod writer;
+
+pub use crate::encodings::rle::RleEncoder;

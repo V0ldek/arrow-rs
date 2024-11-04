@@ -98,6 +98,7 @@
 //! }
 //! ```
 pub mod footer;
+pub mod ignition;
 pub mod metadata;
 pub mod page_encoding_stats;
 pub mod page_index;

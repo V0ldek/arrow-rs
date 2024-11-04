@@ -56,6 +56,10 @@ pub enum Page {
         encoding: Encoding,
         is_sorted: bool,
     },
+    DecoderPage {
+        buf: Bytes,
+        version: String,
+    },
 }
 
 impl Page {
@@ -65,6 +69,7 @@ impl Page {
             Page::DataPage { .. } => PageType::DATA_PAGE,
             Page::DataPageV2 { .. } => PageType::DATA_PAGE_V2,
             Page::DictionaryPage { .. } => PageType::DICTIONARY_PAGE,
+            Page::DecoderPage { .. } => PageType::DECODER_PAGE,
         }
     }
 
@@ -74,6 +79,7 @@ impl Page {
             Page::DataPage { ref buf, .. } => buf,
             Page::DataPageV2 { ref buf, .. } => buf,
             Page::DictionaryPage { ref buf, .. } => buf,
+            Page::DecoderPage { ref buf, .. } => buf,
         }
     }
 
@@ -83,6 +89,7 @@ impl Page {
             Page::DataPage { num_values, .. } => *num_values,
             Page::DataPageV2 { num_values, .. } => *num_values,
             Page::DictionaryPage { num_values, .. } => *num_values,
+            Page::DecoderPage { .. } => 1,
         }
     }
 
@@ -92,6 +99,7 @@ impl Page {
             Page::DataPage { encoding, .. } => *encoding,
             Page::DataPageV2 { encoding, .. } => *encoding,
             Page::DictionaryPage { encoding, .. } => *encoding,
+            Page::DecoderPage { .. } => Encoding::PLAIN,
         }
     }
 
@@ -101,6 +109,7 @@ impl Page {
             Page::DataPage { ref statistics, .. } => statistics.as_ref(),
             Page::DataPageV2 { ref statistics, .. } => statistics.as_ref(),
             Page::DictionaryPage { .. } => None,
+            Page::DecoderPage { .. } => None,
         }
     }
 }
@@ -181,6 +190,7 @@ impl CompressedPage {
             index_page_header: None,
             dictionary_page_header: None,
             data_page_header_v2: None,
+            decoder_page_header: None,
         };
 
         match self.compressed_page {
@@ -227,6 +237,10 @@ impl CompressedPage {
                     is_sorted: Some(is_sorted),
                 };
                 page_header.dictionary_page_header = Some(dictionary_page_header);
+            }
+            Page::DecoderPage { ref version, .. } => {
+                let decoder_page_header = crate::format::DecoderPageHeader { version: version.clone() };
+                page_header.decoder_page_header = Some(decoder_page_header);
             }
         }
         page_header

@@ -18,10 +18,10 @@
 //! Contains file writer API, and provides methods to write row groups and columns by
 //! using row group writers and column writers respectively.
 
-use crate::bloom_filter::Sbbf;
 use crate::format as parquet;
 use crate::format::{ColumnIndex, OffsetIndex};
 use crate::thrift::TSerializable;
+use crate::{bloom_filter::Sbbf, data_type::private::ParquetValueType};
 use std::fmt::Debug;
 use std::io::{BufWriter, IoSlice, Read};
 use std::{io::Write, sync::Arc};
@@ -34,6 +34,7 @@ use crate::column::{
 };
 use crate::data_type::DataType;
 use crate::errors::{ParquetError, Result};
+use crate::file::ignition::IgnitionColumnWriter;
 use crate::file::properties::{BloomFilterPosition, WriterPropertiesPtr};
 use crate::file::reader::ChunkReader;
 use crate::file::{metadata::*, PARQUET_MAGIC};
@@ -524,6 +525,25 @@ impl<'a, W: Write + Send> SerializedRowGroupWriter<'a, W> {
         self.next_column_with_factory(|descr, props, page_writer, on_close| {
             let column_writer = get_column_writer(descr, props, page_writer);
             Ok(SerializedColumnWriter::new(column_writer, Some(on_close)))
+        })
+    }
+
+    pub fn next_column_ignition<T: ParquetValueType>(
+        &mut self,
+    ) -> Result<Option<IgnitionColumnWriter<T, W>>> {
+        self.assert_previous_writer_closed()?;
+        Ok(match self.next_column_desc() {
+            Some(column) => {
+                let props = self.props.clone();
+                let (buf, on_close) = self.get_on_close();
+                Some(IgnitionColumnWriter::new(
+                    column,
+                    buf,
+                    props,
+                    Box::new(on_close),
+                )?)
+            }
+            None => None,
         })
     }
 
@@ -1256,6 +1276,7 @@ mod tests {
                         is_sorted,
                     }
                 }
+                Page::DecoderPage => unimplemented!(),
             };
 
             let compressed_page = CompressedPage::new(compressed_page, uncompressed_len);

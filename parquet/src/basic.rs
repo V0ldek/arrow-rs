@@ -303,6 +303,8 @@ pub enum Encoding {
     /// afterwards. Note that the use of this encoding with FIXED_LEN_BYTE_ARRAY(N) data may
     /// perform poorly for large values of N.
     BYTE_STREAM_SPLIT,
+
+    IGNITION,
 }
 
 impl FromStr for Encoding {
@@ -455,6 +457,7 @@ pub enum PageType {
     DATA_PAGE,
     INDEX_PAGE,
     DICTIONARY_PAGE,
+    DECODER_PAGE,
     DATA_PAGE_V2,
 }
 
@@ -938,6 +941,7 @@ impl TryFrom<parquet::Encoding> for Encoding {
             parquet::Encoding::DELTA_BYTE_ARRAY => Encoding::DELTA_BYTE_ARRAY,
             parquet::Encoding::RLE_DICTIONARY => Encoding::RLE_DICTIONARY,
             parquet::Encoding::BYTE_STREAM_SPLIT => Encoding::BYTE_STREAM_SPLIT,
+            parquet::Encoding::IGNITION => Encoding::IGNITION,
             _ => return Err(general_err!("unexpected parquet encoding: {}", value.0)),
         })
     }
@@ -956,6 +960,7 @@ impl From<Encoding> for parquet::Encoding {
             Encoding::DELTA_BYTE_ARRAY => parquet::Encoding::DELTA_BYTE_ARRAY,
             Encoding::RLE_DICTIONARY => parquet::Encoding::RLE_DICTIONARY,
             Encoding::BYTE_STREAM_SPLIT => parquet::Encoding::BYTE_STREAM_SPLIT,
+            Encoding::IGNITION => parquet::Encoding::IGNITION,
         }
     }
 }
@@ -1025,6 +1030,7 @@ impl From<PageType> for parquet::PageType {
             PageType::INDEX_PAGE => parquet::PageType::INDEX_PAGE,
             PageType::DICTIONARY_PAGE => parquet::PageType::DICTIONARY_PAGE,
             PageType::DATA_PAGE_V2 => parquet::PageType::DATA_PAGE_V2,
+            PageType::DECODER_PAGE => parquet::PageType::DECODER_PAGE,
         }
     }
 }

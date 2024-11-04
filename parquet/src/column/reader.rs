@@ -546,6 +546,7 @@ where
                             )?;
                             return Ok(true);
                         }
+                        Page::DecoderPage { .. } => unimplemented!(),
                     };
                 }
             }

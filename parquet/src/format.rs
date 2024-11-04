@@ -6,8 +6,7 @@
 #![allow(unused_imports)]
 #![allow(unused_extern_crates)]
 #![allow(clippy::too_many_arguments, clippy::type_complexity, clippy::vec_box, clippy::wrong_self_convention)]
-// Fix unexpected `cfg` condition name: `rustfmt` https://github.com/apache/arrow-rs/issues/5725
-//#![cfg_attr(rustfmt, rustfmt_skip)]
+#![cfg_attr(rustfmt, rustfmt_skip)]
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -389,6 +388,7 @@ impl Encoding {
   /// Added in 2.8 for FLOAT and DOUBLE.
   /// Support for INT32, INT64 and FIXED_LEN_BYTE_ARRAY added in 2.11.
   pub const BYTE_STREAM_SPLIT: Encoding = Encoding(9);
+  pub const IGNITION: Encoding = Encoding(10);
   pub const ENUM_VALUES: &'static [Self] = &[
     Self::PLAIN,
     Self::PLAIN_DICTIONARY,
@@ -399,6 +399,7 @@ impl Encoding {
     Self::DELTA_BYTE_ARRAY,
     Self::RLE_DICTIONARY,
     Self::BYTE_STREAM_SPLIT,
+    Self::IGNITION,
   ];
 }
 
@@ -425,6 +426,7 @@ impl From<i32> for Encoding {
       7 => Encoding::DELTA_BYTE_ARRAY,
       8 => Encoding::RLE_DICTIONARY,
       9 => Encoding::BYTE_STREAM_SPLIT,
+      10 => Encoding::IGNITION,
       _ => Encoding(i)
     }
   }
@@ -532,11 +534,13 @@ impl PageType {
   pub const INDEX_PAGE: PageType = PageType(1);
   pub const DICTIONARY_PAGE: PageType = PageType(2);
   pub const DATA_PAGE_V2: PageType = PageType(3);
+  pub const DECODER_PAGE: PageType = PageType(4);
   pub const ENUM_VALUES: &'static [Self] = &[
     Self::DATA_PAGE,
     Self::INDEX_PAGE,
     Self::DICTIONARY_PAGE,
     Self::DATA_PAGE_V2,
+    Self::DECODER_PAGE,
   ];
 }
 
@@ -558,6 +562,7 @@ impl From<i32> for PageType {
       1 => PageType::INDEX_PAGE,
       2 => PageType::DICTIONARY_PAGE,
       3 => PageType::DATA_PAGE_V2,
+      4 => PageType::DECODER_PAGE,
       _ => PageType(i)
     }
   }
@@ -2081,13 +2086,9 @@ impl crate::thrift::TSerializable for LogicalType {
 //
 
 /// Represents a element inside a schema definition.
-///
-///  - if it is a group (inner node) then type is undefined and num_children
-///    is defined
-///  - if it is a primitive type (leaf) then type is defined and
-///    num_children is undefined
-///
-/// Note the  nodes are listed in depth first traversal order.
+///  - if it is a group (inner node) then type is undefined and num_children is defined
+///  - if it is a primitive type (leaf) then type is defined and num_children is undefined
+/// the nodes are listed in depth first traversal order.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SchemaElement {
   /// Data type for this field. Not set if the current element is a non-leaf node
@@ -2519,6 +2520,62 @@ impl crate::thrift::TSerializable for DictionaryPageHeader {
       o_prot.write_bool(fld_var)?;
       o_prot.write_field_end()?
     }
+    o_prot.write_field_stop()?;
+    o_prot.write_struct_end()
+  }
+}
+
+//
+// DecoderPageHeader
+//
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DecoderPageHeader {
+  pub version: String,
+}
+
+impl DecoderPageHeader {
+  pub fn new(version: String) -> DecoderPageHeader {
+    DecoderPageHeader {
+      version,
+    }
+  }
+}
+
+impl crate::thrift::TSerializable for DecoderPageHeader {
+  fn read_from_in_protocol<T: TInputProtocol>(i_prot: &mut T) -> thrift::Result<DecoderPageHeader> {
+    i_prot.read_struct_begin()?;
+    let mut f_1: Option<String> = None;
+    loop {
+      let field_ident = i_prot.read_field_begin()?;
+      if field_ident.field_type == TType::Stop {
+        break;
+      }
+      let field_id = field_id(&field_ident)?;
+      match field_id {
+        1 => {
+          let val = i_prot.read_string()?;
+          f_1 = Some(val);
+        },
+        _ => {
+          i_prot.skip(field_ident.field_type)?;
+        },
+      };
+      i_prot.read_field_end()?;
+    }
+    i_prot.read_struct_end()?;
+    verify_required_field_exists("DecoderPageHeader.version", &f_1)?;
+    let ret = DecoderPageHeader {
+      version: f_1.expect("auto-generated code should have checked for presence of required fields"),
+    };
+    Ok(ret)
+  }
+  fn write_to_out_protocol<T: TOutputProtocol>(&self, o_prot: &mut T) -> thrift::Result<()> {
+    let struct_ident = TStructIdentifier::new("DecoderPageHeader");
+    o_prot.write_struct_begin(&struct_ident)?;
+    o_prot.write_field_begin(&TFieldIdentifier::new("version", TType::String, 1))?;
+    o_prot.write_string(&self.version)?;
+    o_prot.write_field_end()?;
     o_prot.write_field_stop()?;
     o_prot.write_struct_end()
   }
@@ -3154,10 +3211,11 @@ pub struct PageHeader {
   pub index_page_header: Option<IndexPageHeader>,
   pub dictionary_page_header: Option<DictionaryPageHeader>,
   pub data_page_header_v2: Option<DataPageHeaderV2>,
+  pub decoder_page_header: Option<DecoderPageHeader>,
 }
 
 impl PageHeader {
-  pub fn new<F4, F5, F6, F7, F8>(type_: PageType, uncompressed_page_size: i32, compressed_page_size: i32, crc: F4, data_page_header: F5, index_page_header: F6, dictionary_page_header: F7, data_page_header_v2: F8) -> PageHeader where F4: Into<Option<i32>>, F5: Into<Option<DataPageHeader>>, F6: Into<Option<IndexPageHeader>>, F7: Into<Option<DictionaryPageHeader>>, F8: Into<Option<DataPageHeaderV2>> {
+  pub fn new<F4, F5, F6, F7, F8, F9>(type_: PageType, uncompressed_page_size: i32, compressed_page_size: i32, crc: F4, data_page_header: F5, index_page_header: F6, dictionary_page_header: F7, data_page_header_v2: F8, decoder_page_header: F9) -> PageHeader where F4: Into<Option<i32>>, F5: Into<Option<DataPageHeader>>, F6: Into<Option<IndexPageHeader>>, F7: Into<Option<DictionaryPageHeader>>, F8: Into<Option<DataPageHeaderV2>>, F9: Into<Option<DecoderPageHeader>> {
     PageHeader {
       type_,
       uncompressed_page_size,
@@ -3167,6 +3225,7 @@ impl PageHeader {
       index_page_header: index_page_header.into(),
       dictionary_page_header: dictionary_page_header.into(),
       data_page_header_v2: data_page_header_v2.into(),
+      decoder_page_header: decoder_page_header.into(),
     }
   }
 }
@@ -3182,6 +3241,7 @@ impl crate::thrift::TSerializable for PageHeader {
     let mut f_6: Option<IndexPageHeader> = None;
     let mut f_7: Option<DictionaryPageHeader> = None;
     let mut f_8: Option<DataPageHeaderV2> = None;
+    let mut f_9: Option<DecoderPageHeader> = None;
     loop {
       let field_ident = i_prot.read_field_begin()?;
       if field_ident.field_type == TType::Stop {
@@ -3221,6 +3281,10 @@ impl crate::thrift::TSerializable for PageHeader {
           let val = DataPageHeaderV2::read_from_in_protocol(i_prot)?;
           f_8 = Some(val);
         },
+        9 => {
+          let val = DecoderPageHeader::read_from_in_protocol(i_prot)?;
+          f_9 = Some(val);
+        },
         _ => {
           i_prot.skip(field_ident.field_type)?;
         },
@@ -3240,6 +3304,7 @@ impl crate::thrift::TSerializable for PageHeader {
       index_page_header: f_6,
       dictionary_page_header: f_7,
       data_page_header_v2: f_8,
+      decoder_page_header: f_9,
     };
     Ok(ret)
   }
@@ -3277,6 +3342,11 @@ impl crate::thrift::TSerializable for PageHeader {
     }
     if let Some(ref fld_var) = self.data_page_header_v2 {
       o_prot.write_field_begin(&TFieldIdentifier::new("data_page_header_v2", TType::Struct, 8))?;
+      fld_var.write_to_out_protocol(o_prot)?;
+      o_prot.write_field_end()?
+    }
+    if let Some(ref fld_var) = self.decoder_page_header {
+      o_prot.write_field_begin(&TFieldIdentifier::new("decoder_page_header", TType::Struct, 9))?;
       fld_var.write_to_out_protocol(o_prot)?;
       o_prot.write_field_end()?
     }
@@ -4595,7 +4665,7 @@ impl crate::thrift::TSerializable for PageLocation {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct OffsetIndex {
   /// PageLocations, ordered by increasing PageLocation.offset. It is required
-  /// that page_locations\[i\].first_row_index < page_locations\[i+1\].first_row_index.
+  /// that page_locations[i].first_row_index < page_locations[i+1].first_row_index.
   pub page_locations: Vec<PageLocation>,
   /// Unencoded/uncompressed size for BYTE_ARRAY types.
   /// 
@@ -4693,21 +4763,21 @@ impl crate::thrift::TSerializable for OffsetIndex {
 /// 
 /// If this structure is present, OffsetIndex must also be present.
 /// 
-/// For each field in this structure, `<field>`\[i\] refers to the page at
-/// OffsetIndex.page_locations\[i\]
+/// For each field in this structure, <field>[i] refers to the page at
+/// OffsetIndex.page_locations[i]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ColumnIndex {
   /// A list of Boolean values to determine the validity of the corresponding
   /// min and max values. If true, a page contains only null values, and writers
   /// have to set the corresponding entries in min_values and max_values to
-  /// byte\[0\], so that all lists have the same length. If false, the
+  /// byte[0], so that all lists have the same length. If false, the
   /// corresponding entries in min_values and max_values must be valid.
   pub null_pages: Vec<bool>,
   /// Two lists containing lower and upper bounds for the values of each page
   /// determined by the ColumnOrder of the column. These may be the actual
   /// minimum and maximum values found on a page, but can also be (more compact)
   /// values that do not exist on a page. For example, instead of storing ""Blart
-  /// Versenwald III", a writer may set min_values\[i\]="B", max_values\[i\]="C".
+  /// Versenwald III", a writer may set min_values[i]="B", max_values[i]="C".
   /// Such more compact values must still be valid values within the column's
   /// logical type. Readers must make sure that list entries are populated before
   /// using them by inspecting null_pages.
@@ -4715,7 +4785,7 @@ pub struct ColumnIndex {
   pub max_values: Vec<Vec<u8>>,
   /// Stores whether both min_values and max_values are ordered and if so, in
   /// which direction. This allows readers to perform binary searches in both
-  /// lists. Readers cannot assume that max_values\[i\] <= min_values\[i+1\], even
+  /// lists. Readers cannot assume that max_values[i] <= min_values[i+1], even
   /// if the lists are ordered.
   pub boundary_order: BoundaryOrder,
   /// A list containing the number of null values for each page *
@@ -5196,7 +5266,7 @@ pub struct FileMetaData {
   /// Optional key/value metadata *
   pub key_value_metadata: Option<Vec<KeyValue>>,
   /// String for application that wrote this file.  This should be in the format
-  /// `<Application>` version `<App Version>` (build `<App Build Hash>`).
+  /// <Application> version <App Version> (build <App Build Hash>).
   /// e.g. impala version 1.0 (build 6cf94d29b2b7115df4de2c06e2ab4326d721eb55)
   /// 
   pub created_by: Option<String>,

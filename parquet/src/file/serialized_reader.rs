@@ -477,6 +477,15 @@ pub(crate) fn decode_page(
                 statistics: statistics::from_thrift(physical_type, header.statistics)?,
             }
         }
+        PageType::DECODER_PAGE => {
+            let header = page_header.decoder_page_header.ok_or_else(|| {
+                ParquetError::General("Missing decoder data page header".to_string())
+            })?;
+            Page::DecoderPage {
+                buf: buffer,
+                version: header.version,
+            }
+        }
         _ => {
             // For unknown page type (e.g., INDEX_PAGE), skip and read next.
             unimplemented!("Page type {:?} is not supported", page_header.type_)

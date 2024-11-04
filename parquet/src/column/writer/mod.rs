@@ -241,42 +241,42 @@ impl PageMetrics {
 
 // Metrics per column writer
 #[derive(Default)]
-struct ColumnMetrics<T: Default> {
-    total_bytes_written: u64,
-    total_rows_written: u64,
-    total_uncompressed_size: u64,
-    total_compressed_size: u64,
-    total_num_values: u64,
-    dictionary_page_offset: Option<u64>,
-    data_page_offset: Option<u64>,
-    min_column_value: Option<T>,
-    max_column_value: Option<T>,
-    num_column_nulls: u64,
-    column_distinct_count: Option<u64>,
-    variable_length_bytes: Option<i64>,
-    repetition_level_histogram: Option<LevelHistogram>,
-    definition_level_histogram: Option<LevelHistogram>,
+pub(crate) struct ColumnMetrics<T: Default> {
+    pub(crate) total_bytes_written: u64,
+    pub(crate) total_rows_written: u64,
+    pub(crate) total_uncompressed_size: u64,
+    pub(crate) total_compressed_size: u64,
+    pub(crate) total_num_values: u64,
+    pub(crate) dictionary_page_offset: Option<u64>,
+    pub(crate) data_page_offset: Option<u64>,
+    pub(crate) min_column_value: Option<T>,
+    pub(crate) max_column_value: Option<T>,
+    pub(crate) num_column_nulls: u64,
+    pub(crate) column_distinct_count: Option<u64>,
+    pub(crate) variable_length_bytes: Option<i64>,
+    pub(crate) repetition_level_histogram: Option<LevelHistogram>,
+    pub(crate) definition_level_histogram: Option<LevelHistogram>,
 }
 
 impl<T: Default> ColumnMetrics<T> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Default::default()
     }
 
     /// Initialize the repetition level histogram
-    fn with_repetition_level_histogram(mut self, max_level: i16) -> Self {
+    pub(crate) fn with_repetition_level_histogram(mut self, max_level: i16) -> Self {
         self.repetition_level_histogram = LevelHistogram::try_new(max_level);
         self
     }
 
     /// Initialize the definition level histogram
-    fn with_definition_level_histogram(mut self, max_level: i16) -> Self {
+    pub(crate) fn with_definition_level_histogram(mut self, max_level: i16) -> Self {
         self.definition_level_histogram = LevelHistogram::try_new(max_level);
         self
     }
 
     /// Sum `page_histogram` into `chunk_histogram`
-    fn update_histogram(
+    pub(crate) fn update_histogram(
         chunk_histogram: &mut Option<LevelHistogram>,
         page_histogram: &Option<LevelHistogram>,
     ) {
@@ -287,7 +287,7 @@ impl<T: Default> ColumnMetrics<T> {
 
     /// Sum the provided PageMetrics histograms into the chunk histograms. Does nothing if
     /// page histograms are not initialized.
-    fn update_from_page_metrics(&mut self, page_metrics: &PageMetrics) {
+    pub(crate) fn update_from_page_metrics(&mut self, page_metrics: &PageMetrics) {
         ColumnMetrics::<T>::update_histogram(
             &mut self.definition_level_histogram,
             &page_metrics.definition_level_histogram,
@@ -299,7 +299,7 @@ impl<T: Default> ColumnMetrics<T> {
     }
 
     /// Sum the provided page variable_length_bytes into the chunk variable_length_bytes
-    fn update_variable_length_bytes(&mut self, variable_length_bytes: Option<i64>) {
+    pub(crate) fn update_variable_length_bytes(&mut self, variable_length_bytes: Option<i64>) {
         if let Some(var_bytes) = variable_length_bytes {
             *self.variable_length_bytes.get_or_insert(0) += var_bytes;
         }
