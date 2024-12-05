@@ -192,11 +192,12 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
                     self.column_metrics.data_page_offset = Some(page_spec.offset);
                 }
             }
-            PageType::DICTIONARY_PAGE => {
+            PageType::DICTIONARY_PAGE | PageType::DECODER_PAGE => {
                 assert!(
                     self.column_metrics.dictionary_page_offset.is_none(),
                     "Dictionary offset is already set"
                 );
+                // re-use the dictionary_page_offset for the ignition decoder offset
                 self.column_metrics.dictionary_page_offset = Some(page_spec.offset);
             }
             _ => {}
