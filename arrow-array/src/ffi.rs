@@ -193,6 +193,9 @@ fn bit_width(data_type: &DataType, i: usize) -> Result<usize> {
                 "The datatype \"{data_type:?}\" expects 3 buffers, but requested {i}. Please verify that the C data interface is correctly implemented."
             )))
         }
+        // UTF8 has a views buffer, which is u128, and an arbitrary number of data buffers in bytes
+        (DataType::Utf8View, 1) => u128::BITS as _,
+        (DataType::Utf8View, _) => u8::BITS as _,
         // type ids. UnionArray doesn't have null bitmap so buffer index begins with 0.
         (DataType::Union(_, _), 0) => i8::BITS as _,
         // Only DenseUnion has 2nd buffer
@@ -451,6 +454,21 @@ impl<'a> ImportedArrowArray<'a> {
                 let offset_buffer = self.array.buffer(1) as *const i64;
                 // get last offset
                 (unsafe { *offset_buffer.add(len / size_of::<i64>() - 1) }) as usize
+            }
+            (DataType::Utf8View, 1) => {
+                length * 16
+            }
+            (DataType::Utf8View, i) => {
+                if self.array.is_empty() {
+                    return Ok(0);
+                }
+
+                let n_buffers = self.array.num_buffers();
+                if i == n_buffers - 1 {
+                    return Ok(size_of::<i64>() * (n_buffers - 3));
+                }
+                let len_buffer = self.array.buffer(n_buffers - 1) as *const i64;
+                (unsafe { *len_buffer.add(i - 2) }) as usize
             }
             // buffer len of primitive types
             _ => {

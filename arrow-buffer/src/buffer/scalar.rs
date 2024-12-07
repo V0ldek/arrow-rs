@@ -127,7 +127,9 @@ impl<T: ArrowNativeType> From<MutableBuffer> for ScalarBuffer<T> {
 impl<T: ArrowNativeType> From<Buffer> for ScalarBuffer<T> {
     fn from(buffer: Buffer) -> Self {
         let align = std::mem::align_of::<T>();
-        let is_aligned = buffer.as_ptr().align_offset(align) == 0;
+        let ptr = buffer.as_ptr();
+        let alof = ptr.align_offset(align);
+        let is_aligned = alof == 0;
 
         match buffer.deallocation() {
             Deallocation::Standard(_) => assert!(
