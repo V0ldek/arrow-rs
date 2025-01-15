@@ -60,6 +60,25 @@ pub enum Page {
         buf: Bytes,
         version: String,
     },
+    /// Same as DecoderPage, except with an offset into the file instead of a buffer
+    MappedDecoderPage {
+        byte_offset: usize,
+        byte_len: usize,
+        version: String,
+    },
+    /// Same as DataPageV2, except with an offset into the file instead of a buffer
+    MappedDataPageV2 {
+        byte_offset: usize,
+        byte_len: usize,
+        num_values: u32,
+        encoding: Encoding,
+        num_nulls: u32,
+        num_rows: u32,
+        def_levels_byte_len: u32,
+        rep_levels_byte_len: u32,
+        is_compressed: bool,
+        statistics: Option<Statistics>,
+    }
 }
 
 impl Page {
@@ -70,6 +89,8 @@ impl Page {
             Page::DataPageV2 { .. } => PageType::DATA_PAGE_V2,
             Page::DictionaryPage { .. } => PageType::DICTIONARY_PAGE,
             Page::DecoderPage { .. } => PageType::DECODER_PAGE,
+            Page::MappedDecoderPage { .. } => PageType::DECODER_PAGE,
+            Page::MappedDataPageV2 { .. } => PageType::DATA_PAGE_V2,
         }
     }
 
@@ -80,6 +101,8 @@ impl Page {
             Page::DataPageV2 { ref buf, .. } => buf,
             Page::DictionaryPage { ref buf, .. } => buf,
             Page::DecoderPage { ref buf, .. } => buf,
+            Page::MappedDecoderPage { .. } => { unimplemented!() }
+            Page::MappedDataPageV2 { .. } => { unimplemented!() }
         }
     }
 
@@ -90,6 +113,8 @@ impl Page {
             Page::DataPageV2 { num_values, .. } => *num_values,
             Page::DictionaryPage { num_values, .. } => *num_values,
             Page::DecoderPage { .. } => 1,
+            Page::MappedDecoderPage { .. } => 1,
+            Page::MappedDataPageV2 { num_values, .. } => *num_values,
         }
     }
 
@@ -100,6 +125,8 @@ impl Page {
             Page::DataPageV2 { encoding, .. } => *encoding,
             Page::DictionaryPage { encoding, .. } => *encoding,
             Page::DecoderPage { .. } => Encoding::PLAIN,
+            Page::MappedDecoderPage { .. } => Encoding::PLAIN,
+            Page::MappedDataPageV2 { encoding, .. } => *encoding,
         }
     }
 
@@ -110,6 +137,8 @@ impl Page {
             Page::DataPageV2 { ref statistics, .. } => statistics.as_ref(),
             Page::DictionaryPage { .. } => None,
             Page::DecoderPage { .. } => None,
+            Page::MappedDecoderPage { .. } => None,
+            Page::MappedDataPageV2 { ref statistics, .. } => statistics.as_ref(),
         }
     }
 }
@@ -217,6 +246,14 @@ impl CompressedPage {
                 is_compressed,
                 ref statistics,
                 ..
+            } | Page::MappedDataPageV2 {
+                num_nulls,
+                num_rows,
+                def_levels_byte_len,
+                rep_levels_byte_len,
+                is_compressed,
+                ref statistics,
+                ..
             } => {
                 let data_page_header_v2 = crate::format::DataPageHeaderV2 {
                     num_values: num_values as i32,
@@ -238,7 +275,7 @@ impl CompressedPage {
                 };
                 page_header.dictionary_page_header = Some(dictionary_page_header);
             }
-            Page::DecoderPage { ref version, .. } => {
+            Page::DecoderPage { ref version, .. } | Page::MappedDecoderPage { ref version, .. } => {
                 let decoder_page_header = crate::format::DecoderPageHeader { version: version.clone() };
                 page_header.decoder_page_header = Some(decoder_page_header);
             }

@@ -106,7 +106,7 @@ pub mod async_reader;
 pub mod async_writer;
 
 mod record_reader;
-experimental!(mod schema);
+experimental!(pub mod schema);
 
 pub use self::arrow_writer::ArrowWriter;
 #[cfg(feature = "async")]

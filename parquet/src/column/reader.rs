@@ -309,6 +309,7 @@ where
                 };
 
                 // If dictionary, we must read it
+                // todo: ignition must also handle
                 if metadata.is_dict {
                     self.read_dictionary_page()?;
                     continue;
@@ -546,7 +547,21 @@ where
                             )?;
                             return Ok(true);
                         }
-                        Page::DecoderPage { .. } => unimplemented!(),
+                        Page::DecoderPage { buf, version } => {
+                            // which impls of ColumnValueDecoder need to be implemented?
+                            self.values_decoder.set_ignition_decoder(buf, version, Encoding::PLAIN)?;
+                            continue;
+                        },
+                        Page::MappedDecoderPage { .. } => {
+                            // since we are dealing with mapped pages here,
+                            // the primitive_array_ignition ArrayReader will handle decoding.
+                            continue;
+                        }
+                        Page::MappedDataPageV2 { .. } => {
+                            // since we are dealing with mapped pages here,
+                            // the primitive_array_ignition ArrayReader will handle decoding.
+                            return Ok(true);
+                        }
                     };
                 }
             }

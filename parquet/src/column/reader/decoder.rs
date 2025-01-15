@@ -22,7 +22,7 @@ use bytes::Bytes;
 use crate::basic::Encoding;
 use crate::data_type::DataType;
 use crate::encodings::{
-    decoding::{get_decoder, Decoder, DictDecoder, PlainDecoder},
+    decoding::{get_decoder, Decoder, DictDecoder, PlainDecoder, IgnitionDecoder},
     rle::RleDecoder,
 };
 use crate::errors::{ParquetError, Result};
@@ -102,6 +102,16 @@ pub trait ColumnValueDecoder {
         encoding: Encoding,
         is_sorted: bool,
     ) -> Result<()>;
+
+    /// Set the current wasm ignition decoder page
+    fn set_ignition_decoder(
+        &mut self,
+        buf: Bytes,
+        version: String,
+        encoding: Encoding,
+    ) -> Result<()> {
+        unimplemented!();
+    }
 
     /// Set the current data page
     ///
@@ -188,6 +198,28 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
         }
     }
 
+    fn set_ignition_decoder(&mut self, buf: Bytes, version: String, encoding: Encoding) -> Result<()> {
+        if encoding != Encoding::PLAIN {
+            return Err(nyi_err!(
+                "Invalid/Unsupported encoding type for dictionary: {}",
+                encoding
+            ))
+        }
+
+        if self.decoders.contains_key(&Encoding::IGNITION) {
+            return Err(general_err!("Column cannot have more than one ignition decoder"));
+        }
+
+        // do we need to first decode the wasm with a plain decoder before we can use it?
+        // that is what the set_dict function above does
+
+        let mut decoder = IgnitionDecoder::new(version, self.descr.clone())?;
+        decoder.init_ignition(buf)?;
+        self.decoders.insert(Encoding::IGNITION, Box::new(decoder));
+
+        Ok(())
+    }
+
     fn set_data(
         &mut self,
         mut encoding: Encoding,
@@ -205,6 +237,10 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
             self.decoders
                 .get_mut(&encoding)
                 .expect("Decoder for dict should have been set")
+        } else if encoding == Encoding::IGNITION {
+            self.decoders
+                .get_mut(&encoding)
+                .expect("Decoder for ignition should have been set")
         } else {
             // Search cache for data page decoder
             match self.decoders.entry(encoding) {
