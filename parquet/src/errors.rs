@@ -112,6 +112,12 @@ impl From<ArrowError> for ParquetError {
     }
 }
 
+impl From<ignition::RuntimeError> for ParquetError {
+    fn from(e: ignition::RuntimeError) -> ParquetError {
+        ParquetError::External(Box::new(e))
+    }
+}
+
 #[cfg(feature = "object_store")]
 impl From<object_store::Error> for ParquetError {
     fn from(e: object_store::Error) -> ParquetError {
