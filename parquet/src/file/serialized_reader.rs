@@ -43,6 +43,7 @@ use crate::schema::types::Type as SchemaType;
 use crate::thrift::{TCompactSliceInputProtocol, TSerializable};
 use bytes::Bytes;
 use thrift::protocol::TCompactInputProtocol;
+use crate::format;
 
 impl TryFrom<File> for SerializedFileReader<File> {
     type Error = ParquetError;
@@ -280,6 +281,10 @@ impl<R: 'static + ChunkReader> FileReader for SerializedFileReader<R> {
     fn get_row_iter(&self, projection: Option<SchemaType>) -> Result<RowIter> {
         RowIter::from_file(projection, self)
     }
+
+    fn get_file_fd(&self) -> Option<Result<ignition::bundle::MappedFd>> {
+        self.chunk_reader.get_fd()
+    }
 }
 
 /// A serialized implementation for Parquet [`RowGroupReader`].
@@ -382,6 +387,67 @@ fn read_page_header_len<T: Read>(input: &mut T) -> Result<(usize, PageHeader)> {
     };
     let header = read_page_header(&mut tracked)?;
     Ok((tracked.bytes_read, header))
+}
+
+/// attempts to decode a page into one of the two mapped variants
+/// for all other pages, returns None
+fn try_decode_mapped_page(page_header: PageHeader, physical_type: Type, file_offset: usize, data_len: usize) -> Result<Option<Page>> {
+    let mut offset: usize = 0;
+
+
+    // we know there is no decompressor, so we can ignore any compression
+    // for some reason, these ignition encoded pages still show a different compressed/non-compressed size
+    // if let Some(ref header_v2) = page_header.data_page_header_v2 {
+    //     offset = (header_v2.definition_levels_byte_length + header_v2.repetition_levels_byte_length)
+    //         as usize;
+    //     // When is_compressed flag is missing the page is considered compressed
+    //     let can_decompress = header_v2.is_compressed.unwrap_or(true);
+    //     assert_eq!(can_decompress, false);
+    // };
+
+    offset += file_offset;
+
+    match page_header.type_ {
+        PageType::DATA_PAGE_V2 => {
+            let header = page_header
+                .data_page_header_v2
+                .ok_or_else(|| ParquetError::General("Missing V2 data page header".to_string()))?;
+
+            // if we are not ignition encoded, return normal page
+            if header.encoding != format::Encoding::IGNITION {
+                return Ok(None);
+            }
+
+            let is_compressed = header.is_compressed.unwrap_or(true);
+            Ok(Some(Page::MappedDataPageV2 {
+                byte_offset: offset,
+                byte_len: data_len,
+                num_values: header.num_values as u32,
+                encoding: Encoding::try_from(header.encoding)?,
+                num_nulls: header.num_nulls as u32,
+                num_rows: header.num_rows as u32,
+                def_levels_byte_len: header.definition_levels_byte_length as u32,
+                rep_levels_byte_len: header.repetition_levels_byte_length as u32,
+                is_compressed,
+                statistics: statistics::from_thrift(physical_type, header.statistics)?,
+            }))
+        },
+        PageType::DECODER_PAGE => {
+            let header = page_header.decoder_page_header.ok_or_else(|| {
+                ParquetError::General("Missing decoder data page header".to_string())
+            })?;
+            Ok(Some(Page::MappedDecoderPage {
+                byte_offset: offset,
+                byte_len: data_len,
+                version: header.version,
+            }))
+        }
+        _ => {
+            // We only handle mapped pages
+            Ok(None)
+        }
+    }
+
 }
 
 /// Decodes a [`Page`] from the provided `buffer`
@@ -622,6 +688,14 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
 
                     if header.type_ == PageType::INDEX_PAGE {
                         continue;
+                    }
+
+                    // if we are reading a mapped file, we can instead return the mapped variant of the pages
+                    if self.reader.get_fd().is_some() && self.decompressor.is_none() {
+                        assert!(self.decompressor.is_none(), "mapped file doesn't support compression");
+                        if let Some(page) = try_decode_mapped_page(header.clone(), self.physical_type, *offset - data_len, data_len)? {
+                            return Ok(Some(page));
+                        }
                     }
 
                     let mut buffer = Vec::with_capacity(data_len);

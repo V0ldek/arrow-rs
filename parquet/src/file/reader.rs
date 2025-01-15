@@ -21,9 +21,10 @@
 
 use bytes::{Buf, Bytes};
 use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom};
+use std::io::{BufReader, Error, Seek, SeekFrom};
 use std::{io::Read, sync::Arc};
-
+use std::os::fd::{AsFd, AsRawFd};
+use ignition::bundle::MappedFd;
 use crate::bloom_filter::Sbbf;
 use crate::column::page::PageIterator;
 use crate::column::{page::PageReader, reader::ColumnReader};
@@ -65,11 +66,45 @@ pub trait ChunkReader: Length + Send + Sync {
     ///
     /// See [`File::try_clone`] for more information
     fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes>;
+
+    /// Hack to get mapped version of file for ignition
+    /// returns None if no valid fd
+    fn get_fd(&self) -> Option<Result<ignition::bundle::MappedFd>> {
+        None
+    }
 }
 
 impl Length for File {
     fn len(&self) -> u64 {
         self.metadata().map(|m| m.len()).unwrap_or(0u64)
+    }
+}
+
+impl Length for MappedFd {
+    fn len(&self) -> u64 {
+        self.map.len() as u64
+    }
+}
+
+impl ChunkReader for MappedFd {
+    type T = &'static [u8];
+
+    fn get_read(&self, start: u64) -> Result<Self::T> {
+        Ok(&self.map[start as usize..])
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes> {
+        let mut buffer = Vec::with_capacity(length);
+
+        let start = start as usize;
+        buffer.copy_from_slice(&self.map[start..start + length]);
+
+        Ok(buffer.into())
+    }
+
+    fn get_fd(&self) -> Option<Result<MappedFd>> {
+        // Some(Ok(self))
+        unimplemented!()
     }
 }
 
@@ -96,6 +131,20 @@ impl ChunkReader for File {
             ));
         }
         Ok(buffer.into())
+    }
+
+    /// issue with this is that we are still copying data out
+    /// and mapping into a different version.
+    fn get_fd(&self) -> Option<Result<ignition::bundle::MappedFd>> {
+        let fd = MappedFd::map(self, self.len() as usize);
+        match fd {
+            Ok(fd) => {
+                Some(Ok(fd))
+            }
+            Err(e) => {
+                Some(Err(ParquetError::from(e)))
+            }
+        }
     }
 }
 
@@ -141,6 +190,12 @@ pub trait FileReader: Send + Sync {
     /// Projected schema can be a subset of or equal to the file schema, when it is None,
     /// full file schema is assumed.
     fn get_row_iter(&self, projection: Option<SchemaType>) -> Result<RowIter>;
+
+    /// hack to get the fd to ignition
+    /// returns None if no valid fd
+    fn get_file_fd(&self) -> Option<Result<ignition::bundle::MappedFd>> {
+        None
+    }
 }
 
 /// Parquet row group reader API. With this, user can get metadata information about the

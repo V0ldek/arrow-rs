@@ -27,9 +27,11 @@ use crate::arrow::array_reader::{
     FixedSizeListArrayReader, ListArrayReader, MapArrayReader, NullArrayReader,
     PrimitiveArrayReader, RowGroups, StructArrayReader,
 };
+use crate::arrow::array_reader::primitive_array_ignition::PrimitiveArrayIgnitionReader;
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::arrow::ProjectionMask;
-use crate::basic::Type as PhysicalType;
+use crate::basic::{Encoding, Type as PhysicalType};
+use crate::column::page::Page;
 use crate::data_type::{BoolType, DoubleType, FloatType, Int32Type, Int64Type, Int96Type};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::{ColumnDescriptor, ColumnPath, Type};
@@ -239,6 +241,34 @@ fn build_primitive_reader(
 
     let page_iterator = row_groups.column_chunks(col_idx)?;
     let arrow_type = Some(field.arrow_type.clone());
+
+    // peek the first page here and decode which reader we need
+    // this is not the best place to implement a decoder, but doing it here allows us to directly return arrow arrays
+    // ReaderPageIterator is concrete type
+    // dbg!(page_iterator);
+    // use a fresh page iterator here
+    let pr = row_groups.column_chunks(col_idx)?.next();
+    let mut pr = pr.unwrap()?;
+    let page = pr.get_next_page()?;
+    let page = page.unwrap();
+
+    // if we see a DecoderPage, we know this is an Ignition Column
+    // if we see a MappedDecoderPage, we know we are handling the column via mmap, not decoder.
+    if let Page::MappedDecoderPage { .. } = page {
+        assert_eq!(page.encoding(), Encoding::PLAIN, "Ignition decoders should be plain encoded");
+        // for our specific case
+        // assert_eq!(physical_type, PhysicalType::INT32);
+        // assert_eq!(arrow_type, Some(DataType::UInt8));
+
+        let reader = Box::new(PrimitiveArrayIgnitionReader::new(
+            row_groups,
+            page_iterator,
+            column_desc,
+            arrow_type,
+        )?) as _;
+
+        return Ok(Some(reader));
+    }
 
     let reader = match physical_type {
         PhysicalType::BOOLEAN => Box::new(PrimitiveArrayReader::<BoolType>::new(

@@ -44,6 +44,7 @@ mod struct_array;
 
 #[cfg(test)]
 mod test_util;
+mod primitive_array_ignition;
 
 pub use builder::build_array_reader;
 pub use byte_array::make_byte_array_reader;
@@ -109,6 +110,12 @@ pub trait RowGroups {
 
     /// Returns a [`PageIterator`] for the column chunks with the given leaf column index
     fn column_chunks(&self, i: usize) -> Result<Box<dyn PageIterator>>;
+
+    /// hack to get the file's fd to ignition decoder
+    /// returns None if no valid fd
+    fn file_fd(&self) ->  Option<Result<ignition::bundle::MappedFd>> {
+        None
+    }
 }
 
 impl RowGroups for Arc<dyn FileReader> {
@@ -119,6 +126,10 @@ impl RowGroups for Arc<dyn FileReader> {
     fn column_chunks(&self, column_index: usize) -> Result<Box<dyn PageIterator>> {
         let iterator = FilePageIterator::new(column_index, Arc::clone(self))?;
         Ok(Box::new(iterator))
+    }
+
+    fn file_fd(&self) -> Option<Result<ignition::bundle::MappedFd>> {
+        self.get_file_fd()
     }
 }
 

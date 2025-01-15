@@ -27,7 +27,7 @@ use arrow_schema::{ArrowError, DataType as ArrowType, Schema, SchemaRef};
 use arrow_select::filter::prep_null_mask_filter;
 pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
 pub use selection::{RowSelection, RowSelector};
-
+use ignition::bundle::MappedFd;
 pub use crate::arrow::array_reader::RowGroups;
 use crate::arrow::array_reader::{build_array_reader, ArrayReader};
 use crate::arrow::schema::{parquet_to_arrow_schema_and_fields, ParquetField};
@@ -667,6 +667,10 @@ impl<T: ChunkReader + 'static> RowGroups for ReaderRowGroups<T> {
             metadata: self.metadata.clone(),
             row_groups: self.row_groups.clone().into_iter(),
         }))
+    }
+
+    fn file_fd(&self) -> Option<Result<MappedFd>> {
+        self.reader.get_fd()
     }
 }
 
