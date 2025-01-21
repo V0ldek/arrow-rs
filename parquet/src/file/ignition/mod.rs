@@ -223,7 +223,7 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
             column_index: None,
             offset_index: None,
         };
-        println!("Column close: {result:?}");
+
         (self.on_close)(result)?;
 
         Ok(())

@@ -13,6 +13,7 @@ use ignition::{row, IgnitionJob, IgnitionRuntime, RuntimeError};
 use crate::arrow::array_reader::{read_records, ArrayReader, PrimitiveArrayReader, RowGroups};
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::Encoding;
+use crate::file::footer::decode_metadata;
 use crate::file::reader::RowGroupReader;
 use crate::schema::types::ColumnDescPtr;
 
@@ -73,6 +74,7 @@ where
 
         let mut config = ConfigBuilder::new();
         config.set_worker_thread_limit(1);
+        config.compile_with_debug(true); // debug mode!
         let config = config.into_config();
         let runtime = ignition::build_engine(config)?;
 
@@ -244,9 +246,10 @@ where
                     if let Some(hashed_job) = self.job_bundle.take() {
                         // replace our job with a new one
                         let fd = match hashed_job.bundle {
+                            IgnitionBundle::ExtensionOwned(_, fd, _) => { fd }
                             IgnitionBundle::ExtensionSameFile { fd, .. } => { fd }
                             _ => {
-                                return Err(general_err!("Existing ignition bundle was not of type: ExtensionSameFile"));
+                                return Err(general_err!("Existing ignition bundle was not of correct type"));
                             }
                         };
 
@@ -294,6 +297,26 @@ where
                     job.job.force_offset_range(offset as _, length as _);
 
                     // todo, only decode what we need here
+
+                    // run natively for perf debug
+                    // let schema = Schema::new(vec![Field::new("ignition_col", self.data_type.clone(), false)]);
+                    // let mut native_job = self.runtime.init_native_job("rle_linestatus_paged", (&schema).into())?;
+                    // let fd = match &job.bundle {
+                    //     IgnitionBundle::ExtensionOwned(_, fd, _) => { fd.map }
+                    //     _ => {
+                    //         panic!();
+                    //     }
+                    // };
+                    // unsafe {
+                    //     let z = read_metadata(fd.as_ptr().add(offset), num_rows as _);
+                    //     dbg!(&z);
+                    //     let mut dc = DecodedColumn::new();
+                    //     decode_column(&mut dc, &z, 0, num_rows as _);
+                    //     // dbg!(String::from_utf8(dc.data.clone()));
+                    // }
+
+                    // let ign_record_batch = self.runtime.run_native_job(&mut native_job, fd, 0, num_rows as usize)?;
+
                     let ign_record_batch = self.runtime.run_blocking_job(&mut job.job, 0, num_rows as usize)?;
                     assert_eq!(ign_record_batch.row_count(), num_rows as usize);
 
@@ -346,4 +369,224 @@ where
     fn get_rep_levels(&self) -> Option<&[i16]> {
         self.rep_levels_buffer.as_deref()
     }
+}
+
+// fsst testing
+
+#[derive(Debug)]
+struct FsstColumn {
+    table: SymbolTable,
+    offsets: *const u32,
+    data: *const u8,
+}
+
+#[derive(Debug)]
+struct SymbolTable {
+    symbols: *const u64,
+    lens: *const u8,
+}
+fn read_metadata(data: *const u8, row_count: usize) -> FsstColumn {
+    let data_header = data.cast::<u32>();
+    read_column_metadata(data, unsafe { data_header.read() }, row_count)
+}
+
+fn read_column_metadata(data: *const u8, start: u32, row_count: usize) -> FsstColumn {
+    // First is the symbol table.
+    let ptr = unsafe { data.add(start as usize) };
+    let (symbol_table, ptr_after_symbols) = read_symbol_table_data(ptr);
+    // Then we have (row_count + 1) offsets.
+    let offsets = ptr_after_symbols.cast::<u32>();
+    // And finally the actual data.
+    let string_data = unsafe { offsets.add(row_count + 1).cast::<u8>() };
+
+    dbg!(
+        "column descr (symboltab, offsets, strings): {:?} {:?} {:?}",
+        ptr,
+        ptr_after_symbols,
+        string_data
+    );
+
+    FsstColumn {
+        table: symbol_table,
+        offsets,
+        data: string_data,
+    }
+}
+
+fn read_symbol_table_data(data: *const u8) -> (SymbolTable, *const u8) {
+    // The encoding has 1 + N bytes + padding + 8*N, where N is the number of symbols in the table,
+    // and padding is the amount required to have symbols aligned to the 8-byte boundary.
+    // |N: u8|len0:u8|len1:u8|...|lenN:u8|opt_padding|sym0: u64|sym1: u64|...|symN:u64|
+    let len_byte = unsafe { data.read() };
+    let len = len_byte as usize;
+    let lens = unsafe { data.add(1) };
+    let rem = (len + 1) % 8;
+    let symbols_offset = if rem == 0 {
+        len + 1
+    } else {
+        len + 1 + (8 - rem)
+    };
+    let symbols = unsafe { data.add(symbols_offset).cast::<u64>() };
+    let end = unsafe { symbols.add(len).cast::<u8>() };
+
+    let table = SymbolTable { symbols, lens };
+    (table, end)
+}
+
+#[derive(Debug)]
+struct DecodedColumn {
+    data: Vec<u8>,
+    data_offset: usize,
+    validity: Vec<u8>,
+    offsets: Vec<u32>,
+    null_count: u32,
+    validity_byte: u8,
+    validity_byte_idx: usize,
+}
+
+
+impl DecodedColumn {
+    fn new() -> Self {
+        DecodedColumn {
+            data: Vec::new(),
+            data_offset: 0,
+            validity: Vec::new(),
+            offsets: Vec::new(),
+            null_count: 0,
+            validity_byte: 0,
+            validity_byte_idx: 0,
+        }
+    }
+
+    fn prepare(&mut self, tuple_count: usize, total_compressed_len: usize) {
+        self.data.clear();
+        self.data.reserve(2 * total_compressed_len);
+        self.data_offset = 0;
+        self.validity.clear();
+        self.validity.reserve((tuple_count + 7) / 8);
+        self.offsets.clear();
+        self.offsets.reserve(tuple_count);
+        self.null_count = 0;
+        self.validity_byte = 0;
+        self.validity_byte_idx = 0;
+        self.offsets.push(0);
+    }
+
+    fn ptr_for_next_value(&mut self, max_len: usize) -> *mut u8 {
+        let start = self.data_offset;
+        let end = self.data_offset + max_len;
+        if end >= self.data.len() {
+            self.data.resize(end + 8, 0);
+        }
+        unsafe { self.data.as_mut_ptr().add(start) }
+    }
+
+    fn commit_value(&mut self, len: usize) {
+        self.validity_byte |= 1 << self.validity_byte_idx;
+        self.validity_byte_idx += 1;
+
+        self.try_push_validity();
+
+        self.data_offset += len;
+        self.offsets.push(self.data_offset as u32);
+    }
+
+    fn push_null(&mut self) {
+        self.validity_byte_idx += 1;
+        self.null_count += 1;
+
+        self.try_push_validity();
+        self.offsets.push(self.data_offset as u32);
+    }
+
+    fn try_push_validity(&mut self) {
+        if self.validity_byte_idx == 8 {
+            self.force_push_validity();
+        }
+    }
+
+    fn force_push_validity(&mut self) {
+        self.validity.push(self.validity_byte);
+        self.validity_byte = 0;
+        self.validity_byte_idx = 0;
+    }
+
+    fn finish(&mut self) {
+        if self.validity_byte_idx != 0 {
+            self.force_push_validity();
+        }
+    }
+
+    fn null_count(&self) -> u32 {
+        self.null_count
+    }
+
+    fn data_ptr(&self) -> *const u8 {
+        self.data.as_ptr()
+    }
+
+    fn validity_ptr(&self) -> *const u8 {
+        self.validity.as_ptr()
+    }
+
+    fn offsets_ptr(&self) -> *const u8 {
+        self.offsets.as_ptr().cast()
+    }
+}
+
+const FSST_ESCAPE: u8 = 0xFF;
+
+unsafe fn decode_column(
+    column: &mut DecodedColumn,
+    compressed: &FsstColumn,
+    start_tuple: usize,
+    tuple_count: usize,
+) {
+    dbg!(
+        "decode column data, offsets: {:?} {:?}",
+        compressed.data,
+        compressed.offsets
+    );
+    let offset_of_first = compressed.offsets.add(start_tuple).read() as usize;
+    let offset_of_after_last = compressed.offsets.add(start_tuple + tuple_count).read() as usize;
+    // dbg!("offsets: {} to {}", offset_of_first, offset_of_after_last);
+    column.prepare(tuple_count, offset_of_after_last - offset_of_first);
+
+    for tuple_idx in start_tuple..(start_tuple + tuple_count) {
+        // dbg!("tuple_idx: {}", tuple_idx);
+        let start_offset = compressed.offsets.add(tuple_idx).read() as usize;
+        let end_offset = compressed.offsets.add(tuple_idx + 1).read() as usize;
+        let compressed_len = end_offset - start_offset;
+        // dbg!("offsets: {} to {}", start_offset, end_offset);
+
+        if compressed_len == 0 {
+            column.push_null();
+        } else {
+            // dbg!("requesting ptr_for_next_value: {}", compressed_len * 8);
+            let ptr = column.ptr_for_next_value(compressed_len * 8);
+            let mut read_i = 0;
+            let mut write_i = 0;
+            while read_i < compressed_len {
+                let b = compressed.data.add(start_offset + read_i).read();
+                read_i += 1;
+
+                if b == FSST_ESCAPE {
+                    let b = compressed.data.add(start_offset + read_i).read();
+                    // dbg!("WRITE 8: {:?}", ptr.add(write_i));
+                    ptr.add(write_i).write(b);
+                    read_i += 1;
+                    write_i += 1;
+                } else {
+                    let len = compressed.table.lens.add(b as usize).read();
+                    let symbol = compressed.table.symbols.add(b as usize).read();
+                    // dbg!("WRITE 64: {:?}", ptr.add(write_i));
+                    ptr.add(write_i).cast::<u64>().write_unaligned(symbol);
+                    write_i += len as usize;
+                }
+            }
+            column.commit_value(write_i);
+        }
+    }
+
+    column.finish();
 }
