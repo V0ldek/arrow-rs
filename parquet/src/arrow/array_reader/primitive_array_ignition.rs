@@ -74,7 +74,8 @@ where
 
         let mut config = ConfigBuilder::new();
         config.set_worker_thread_limit(1);
-        config.compile_with_debug(true); // debug mode!
+        config.enable_opentelemetry(true);
+        //config.compile_with_debug(true); // debug mode!
         let config = config.into_config();
         let runtime = ignition::build_engine(config)?;
 
@@ -115,6 +116,7 @@ where
     // ParquetRecordBatchReader iterator::next() will call in a loop
 
     // however, we need to store everything that we read, as consume_batch needs to return everything
+    #[tracing::instrument(skip(self))]
     fn read_records(&mut self, batch_size: usize) -> crate::errors::Result<usize> {
         let mut records_read = 0;
 
@@ -195,7 +197,8 @@ where
         self.reported_len = std::cmp::min(records_read, batch_size);
         Ok(self.reported_len)
     }
-
+    
+    #[tracing::instrument(skip(self))]
     fn consume_batch(&mut self) -> crate::errors::Result<ArrayRef> {
         let mut total_decoded = 0;
 

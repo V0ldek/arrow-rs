@@ -19,12 +19,6 @@
 //! readers to read individual column chunks, or access record
 //! iterator.
 
-use bytes::{Buf, Bytes};
-use std::fs::File;
-use std::io::{BufReader, Error, Seek, SeekFrom};
-use std::{io::Read, sync::Arc};
-use std::os::fd::{AsFd, AsRawFd};
-use ignition::bundle::MappedFd;
 use crate::bloom_filter::Sbbf;
 use crate::column::page::PageIterator;
 use crate::column::{page::PageReader, reader::ColumnReader};
@@ -33,6 +27,12 @@ use crate::file::metadata::*;
 pub use crate::file::serialized_reader::{SerializedFileReader, SerializedPageReader};
 use crate::record::reader::RowIter;
 use crate::schema::types::Type as SchemaType;
+use bytes::{Buf, Bytes};
+use ignition::bundle::MappedFd;
+use std::fs::File;
+use std::io::{BufReader, Error, Seek, SeekFrom};
+use std::os::fd::{AsFd, AsRawFd};
+use std::{io::Read, sync::Arc};
 
 use crate::basic::Type;
 
@@ -138,12 +138,8 @@ impl ChunkReader for File {
     fn get_fd(&self) -> Option<Result<ignition::bundle::MappedFd>> {
         let fd = MappedFd::map(self, self.len() as usize);
         match fd {
-            Ok(fd) => {
-                Some(Ok(fd))
-            }
-            Err(e) => {
-                Some(Err(ParquetError::from(e)))
-            }
+            Ok(fd) => Some(Ok(fd)),
+            Err(e) => Some(Err(ParquetError::from(e))),
         }
     }
 }
