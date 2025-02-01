@@ -1,11 +1,18 @@
 use std::any::Any;
+use std::cell::OnceCell;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::slice;
+use std::sync::LazyLock;
 use crate::errors::ParquetError;
-use arrow_array::{Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, StringArray};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Int8Type, UInt8Type};
+use arrow_buffer::{Buffer, ToByteSlice};
+use arrow_data::ArrayData;
 use crate::arrow::array_reader::primitive_array::IntoBuffer;
 use crate::arrow::record_reader::RecordReader;
 use crate::column::page::{Page, PageIterator, PageReader};
-use arrow_schema::{DataType as ArrowType, Field, Schema, TimeUnit};
+use arrow_schema::{ArrowError, DataType as ArrowType, Field, Schema, TimeUnit};
 use bytes::Bytes;
 use ignition::bundle::{IgnitionBundle, MappedFd};
 use ignition::config::ConfigBuilder;
@@ -13,16 +20,28 @@ use ignition::{row, IgnitionJob, IgnitionRuntime, RuntimeError};
 use crate::arrow::array_reader::{read_records, ArrayReader, PrimitiveArrayReader, RowGroups};
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::Encoding;
-use crate::file::footer::decode_metadata;
+use crate::data_type::ByteArray;
 use crate::file::reader::RowGroupReader;
 use crate::schema::types::ColumnDescPtr;
+
+static RUNTIME: LazyLock<Result<IgnitionRuntime, RuntimeError>> = LazyLock::new(|| {
+    let mut config = ConfigBuilder::new();
+    config.set_worker_thread_limit(1);
+    // config.compile_with_debug(true); // debug mode!
+    // config.enable_opentelemetry(true);
+    // config.validate_utf8(false);
+    let config = config.into_config();
+    let runtime = ignition::build_engine(config);
+
+    runtime
+});
 
 /// Ignition version of the PrimitiveArrayReader
 pub struct PrimitiveArrayIgnitionReader
 where
 {
     fd: MappedFd,
-    runtime: IgnitionRuntime,
+    runtime: &'static IgnitionRuntime,
     job_bundle: Option<HashedIgnitionJob>,
     data_type: ArrowType,
     buf: Option<Bytes>,
@@ -72,11 +91,11 @@ where
                 .clone(),
         };
 
-        let mut config = ConfigBuilder::new();
-        config.set_worker_thread_limit(1);
-        config.compile_with_debug(true); // debug mode!
-        let config = config.into_config();
-        let runtime = ignition::build_engine(config)?;
+        // todo: IDK!!
+        let runtime = match &*RUNTIME {
+            Ok(r) => r,
+            Err(e) => panic!("{}", e),
+        };
 
         let fd = row_groups.file_fd().ok_or_else(|| {
             return general_err!("RowGroups should be a mapped file");
@@ -115,6 +134,7 @@ where
     // ParquetRecordBatchReader iterator::next() will call in a loop
 
     // however, we need to store everything that we read, as consume_batch needs to return everything
+    #[tracing::instrument(skip(self))]
     fn read_records(&mut self, batch_size: usize) -> crate::errors::Result<usize> {
         let mut records_read = 0;
 
@@ -192,10 +212,14 @@ where
         }
 
         // say we read up to batch_size rows
+        // probs error due to read being called twice in a row
+        assert_eq!(self.reported_len, 0);
         self.reported_len = std::cmp::min(records_read, batch_size);
+        // dbg!(records_read, batch_size);
         Ok(self.reported_len)
     }
 
+    #[tracing::instrument(skip(self))]
     fn consume_batch(&mut self) -> crate::errors::Result<ArrayRef> {
         let mut total_decoded = 0;
 
@@ -208,9 +232,11 @@ where
                 let r = leftovers.slice(self.reported_len, leftovers.len() - self.reported_len);
 
                 self.leftovers = Some(r);
+                self.reported_len = 0;
                 return Ok(l);
             }
             if leftovers.len() == self.reported_len {
+                self.reported_len = 0;
                 return Ok(leftovers);
             }
 
@@ -253,6 +279,8 @@ where
                             }
                         };
 
+                        // todo: actually can move to non-owned variant, which saves having to mmap
+                        // one file multiple times
                         let wasm = Vec::from(slice);
                         let bundle = IgnitionBundle::new_extension_from_bytes(wasm, Some(fd), (&schema).into())?;
 
@@ -300,35 +328,35 @@ where
 
                     // run natively for perf debug
                     // let schema = Schema::new(vec![Field::new("ignition_col", self.data_type.clone(), false)]);
-                    // let mut native_job = self.runtime.init_native_job("rle_linestatus_paged", (&schema).into())?;
+                    // // let mut native_job = self.runtime.init_native_job("rle_linestatus_paged", (&schema).into())?;
+                    // let mut native_job = self.runtime.init_native_job("fsst_single_column_paged", (&schema).into())?;
                     // let fd = match &job.bundle {
                     //     IgnitionBundle::ExtensionOwned(_, fd, _) => { fd.map }
                     //     _ => {
                     //         panic!();
                     //     }
                     // };
-                    // unsafe {
-                    //     let z = read_metadata(fd.as_ptr().add(offset), num_rows as _);
-                    //     dbg!(&z);
-                    //     let mut dc = DecodedColumn::new();
-                    //     decode_column(&mut dc, &z, 0, num_rows as _);
-                    //     // dbg!(String::from_utf8(dc.data.clone()));
-                    // }
-
-                    // let ign_record_batch = self.runtime.run_native_job(&mut native_job, fd, 0, num_rows as usize)?;
+                    //
+                    // let data_bytes = unsafe { slice::from_raw_parts(fd.as_ptr().add(offset), length) };
+                    // let ign_record_batch = self.runtime.run_native_job(&mut native_job, data_bytes, 0, num_rows as usize)?;
 
                     let ign_record_batch = self.runtime.run_blocking_job(&mut job.job, 0, num_rows as usize)?;
+                    // dbg!(ign_record_batch.row_count(), ign_record_batch.null_count());
                     assert_eq!(ign_record_batch.row_count(), num_rows as usize);
 
-                    let field = Field::new(self.column_desc.name(), self.data_type.clone(), false);
+                    let nullable = self.column_desc.max_def_level() > 0;
+                    let field = Field::new(self.column_desc.name(), self.data_type.clone(), nullable);
                     let schema = Schema::new(vec![std::sync::Arc::new(field)]);
 
                     let record_batch = ign_record_batch.into_arrow_record_batch(std::sync::Arc::new(schema));
                     let mut record_batch = record_batch.map_err(|e| RuntimeError::ArrowError(e))?;
-
                     assert_eq!(record_batch.num_columns(), 1);
 
-                    let mut decoded = record_batch.remove_column(0);
+                    // we need to clone out the data from ignition, because it is overwritten on the next invocation
+                    let decoded = record_batch.remove_column(0);
+                    let decoded = deep_clone_array(&decoded.into_data())?;
+                    let mut decoded = arrow_array::make_array(decoded);
+
                     assert_eq!(decoded.len(), num_rows as usize);
 
                     // if we decoded more than we were meant to return, store them as leftovers
@@ -352,14 +380,21 @@ where
             }
         }
 
-        assert_eq!(array.len(), self.reported_len);
-        assert_eq!(self.seen_pages.len(), 0);
+        // // we actually need to copy out the remainder between ignition invocations
+        // // not easy to get arrow to deep copy the buffers
+        // // todo: technically, we don't need to clone always, only when buffers are fresh from ignition
+        // if let Some(leftovers) = self.leftovers.as_ref() {
+        //     let array_data = deep_clone_array(&leftovers.to_data())?;
+        //     let cloned = arrow_array::array::make_array(array_data);
+        //     self.leftovers = Some(cloned);
+        // }
+
+        self.reported_len = 0;
         Ok(array)
     }
 
     fn skip_records(&mut self, num_records: usize) -> crate::errors::Result<usize> {
         todo!()
-        // we can only skip in page granularity
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {
@@ -371,222 +406,31 @@ where
     }
 }
 
-// fsst testing
+// recursively clone
+fn deep_clone_array(original: &ArrayData) -> Result<ArrayData, ArrowError> {
+    let mut buffers = vec![];
+    let mut child_data = vec![];
 
-#[derive(Debug)]
-struct FsstColumn {
-    table: SymbolTable,
-    offsets: *const u32,
-    data: *const u8,
-}
-
-#[derive(Debug)]
-struct SymbolTable {
-    symbols: *const u64,
-    lens: *const u8,
-}
-fn read_metadata(data: *const u8, row_count: usize) -> FsstColumn {
-    let data_header = data.cast::<u32>();
-    read_column_metadata(data, unsafe { data_header.read() }, row_count)
-}
-
-fn read_column_metadata(data: *const u8, start: u32, row_count: usize) -> FsstColumn {
-    // First is the symbol table.
-    let ptr = unsafe { data.add(start as usize) };
-    let (symbol_table, ptr_after_symbols) = read_symbol_table_data(ptr);
-    // Then we have (row_count + 1) offsets.
-    let offsets = ptr_after_symbols.cast::<u32>();
-    // And finally the actual data.
-    let string_data = unsafe { offsets.add(row_count + 1).cast::<u8>() };
-
-    dbg!(
-        "column descr (symboltab, offsets, strings): {:?} {:?} {:?}",
-        ptr,
-        ptr_after_symbols,
-        string_data
-    );
-
-    FsstColumn {
-        table: symbol_table,
-        offsets,
-        data: string_data,
-    }
-}
-
-fn read_symbol_table_data(data: *const u8) -> (SymbolTable, *const u8) {
-    // The encoding has 1 + N bytes + padding + 8*N, where N is the number of symbols in the table,
-    // and padding is the amount required to have symbols aligned to the 8-byte boundary.
-    // |N: u8|len0:u8|len1:u8|...|lenN:u8|opt_padding|sym0: u64|sym1: u64|...|symN:u64|
-    let len_byte = unsafe { data.read() };
-    let len = len_byte as usize;
-    let lens = unsafe { data.add(1) };
-    let rem = (len + 1) % 8;
-    let symbols_offset = if rem == 0 {
-        len + 1
-    } else {
-        len + 1 + (8 - rem)
-    };
-    let symbols = unsafe { data.add(symbols_offset).cast::<u64>() };
-    let end = unsafe { symbols.add(len).cast::<u8>() };
-
-    let table = SymbolTable { symbols, lens };
-    (table, end)
-}
-
-#[derive(Debug)]
-struct DecodedColumn {
-    data: Vec<u8>,
-    data_offset: usize,
-    validity: Vec<u8>,
-    offsets: Vec<u32>,
-    null_count: u32,
-    validity_byte: u8,
-    validity_byte_idx: usize,
-}
-
-
-impl DecodedColumn {
-    fn new() -> Self {
-        DecodedColumn {
-            data: Vec::new(),
-            data_offset: 0,
-            validity: Vec::new(),
-            offsets: Vec::new(),
-            null_count: 0,
-            validity_byte: 0,
-            validity_byte_idx: 0,
-        }
+    for buffer in original.buffers() {
+        // let buf = Buffer::from_bytes(Bytes::copy_from_slice(buffer.as_slice()).into());
+        // these other options don't work for some reason
+        // let buf = Buffer::from(buffer.as_slice());
+        let buf = Buffer::from_slice_ref(buffer.as_slice());
+        buffers.push(buf);
     }
 
-    fn prepare(&mut self, tuple_count: usize, total_compressed_len: usize) {
-        self.data.clear();
-        self.data.reserve(2 * total_compressed_len);
-        self.data_offset = 0;
-        self.validity.clear();
-        self.validity.reserve((tuple_count + 7) / 8);
-        self.offsets.clear();
-        self.offsets.reserve(tuple_count);
-        self.null_count = 0;
-        self.validity_byte = 0;
-        self.validity_byte_idx = 0;
-        self.offsets.push(0);
+    for child in original.child_data() {
+        child_data.push(deep_clone_array(child)?)
     }
 
-    fn ptr_for_next_value(&mut self, max_len: usize) -> *mut u8 {
-        let start = self.data_offset;
-        let end = self.data_offset + max_len;
-        if end >= self.data.len() {
-            self.data.resize(end + 8, 0);
-        }
-        unsafe { self.data.as_mut_ptr().add(start) }
-    }
+    let array_data = ArrayData::builder(original.data_type().clone())
+        .len(original.len())
+        .offset(original.offset())
+        .buffers(buffers)
+        .child_data(child_data)
+        // this clone clones an arc
+        .nulls(original.nulls().cloned())
+        .build()?;
 
-    fn commit_value(&mut self, len: usize) {
-        self.validity_byte |= 1 << self.validity_byte_idx;
-        self.validity_byte_idx += 1;
-
-        self.try_push_validity();
-
-        self.data_offset += len;
-        self.offsets.push(self.data_offset as u32);
-    }
-
-    fn push_null(&mut self) {
-        self.validity_byte_idx += 1;
-        self.null_count += 1;
-
-        self.try_push_validity();
-        self.offsets.push(self.data_offset as u32);
-    }
-
-    fn try_push_validity(&mut self) {
-        if self.validity_byte_idx == 8 {
-            self.force_push_validity();
-        }
-    }
-
-    fn force_push_validity(&mut self) {
-        self.validity.push(self.validity_byte);
-        self.validity_byte = 0;
-        self.validity_byte_idx = 0;
-    }
-
-    fn finish(&mut self) {
-        if self.validity_byte_idx != 0 {
-            self.force_push_validity();
-        }
-    }
-
-    fn null_count(&self) -> u32 {
-        self.null_count
-    }
-
-    fn data_ptr(&self) -> *const u8 {
-        self.data.as_ptr()
-    }
-
-    fn validity_ptr(&self) -> *const u8 {
-        self.validity.as_ptr()
-    }
-
-    fn offsets_ptr(&self) -> *const u8 {
-        self.offsets.as_ptr().cast()
-    }
-}
-
-const FSST_ESCAPE: u8 = 0xFF;
-
-unsafe fn decode_column(
-    column: &mut DecodedColumn,
-    compressed: &FsstColumn,
-    start_tuple: usize,
-    tuple_count: usize,
-) {
-    dbg!(
-        "decode column data, offsets: {:?} {:?}",
-        compressed.data,
-        compressed.offsets
-    );
-    let offset_of_first = compressed.offsets.add(start_tuple).read() as usize;
-    let offset_of_after_last = compressed.offsets.add(start_tuple + tuple_count).read() as usize;
-    // dbg!("offsets: {} to {}", offset_of_first, offset_of_after_last);
-    column.prepare(tuple_count, offset_of_after_last - offset_of_first);
-
-    for tuple_idx in start_tuple..(start_tuple + tuple_count) {
-        // dbg!("tuple_idx: {}", tuple_idx);
-        let start_offset = compressed.offsets.add(tuple_idx).read() as usize;
-        let end_offset = compressed.offsets.add(tuple_idx + 1).read() as usize;
-        let compressed_len = end_offset - start_offset;
-        // dbg!("offsets: {} to {}", start_offset, end_offset);
-
-        if compressed_len == 0 {
-            column.push_null();
-        } else {
-            // dbg!("requesting ptr_for_next_value: {}", compressed_len * 8);
-            let ptr = column.ptr_for_next_value(compressed_len * 8);
-            let mut read_i = 0;
-            let mut write_i = 0;
-            while read_i < compressed_len {
-                let b = compressed.data.add(start_offset + read_i).read();
-                read_i += 1;
-
-                if b == FSST_ESCAPE {
-                    let b = compressed.data.add(start_offset + read_i).read();
-                    // dbg!("WRITE 8: {:?}", ptr.add(write_i));
-                    ptr.add(write_i).write(b);
-                    read_i += 1;
-                    write_i += 1;
-                } else {
-                    let len = compressed.table.lens.add(b as usize).read();
-                    let symbol = compressed.table.symbols.add(b as usize).read();
-                    // dbg!("WRITE 64: {:?}", ptr.add(write_i));
-                    ptr.add(write_i).cast::<u64>().write_unaligned(symbol);
-                    write_i += len as usize;
-                }
-            }
-            column.commit_value(write_i);
-        }
-    }
-
-    column.finish();
+    Ok(array_data)
 }
