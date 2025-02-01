@@ -21,7 +21,7 @@
 use std::collections::VecDeque;
 use std::iter;
 use std::{fs::File, io::Read, path::Path, sync::Arc};
-
+use std::hash::{DefaultHasher, Hash, Hasher};
 use crate::basic::{Encoding, Type};
 use crate::bloom_filter::Sbbf;
 use crate::column::page::{Page, PageMetadata, PageReader};
@@ -691,7 +691,8 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     }
 
                     // if we are reading a mapped file, we can instead return the mapped variant of the pages
-                    if self.reader.get_fd().is_some() && self.decompressor.is_none() {
+                    // we could implement a MappedSerializedPageReader to avoid having to check this
+                    if self.reader.has_fd() && self.decompressor.is_none() {
                         assert!(self.decompressor.is_none(), "mapped file doesn't support compression");
                         if let Some(page) = try_decode_mapped_page(header.clone(), self.physical_type, *offset - data_len, data_len)? {
                             return Ok(Some(page));

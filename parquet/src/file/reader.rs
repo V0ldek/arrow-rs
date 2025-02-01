@@ -72,6 +72,11 @@ pub trait ChunkReader: Length + Send + Sync {
     fn get_fd(&self) -> Option<Result<ignition::bundle::MappedFd>> {
         None
     }
+
+    /// avoid calling get_fd, which clones fd
+    fn has_fd(&self) -> bool {
+        false
+    }
 }
 
 impl Length for File {
@@ -145,6 +150,10 @@ impl ChunkReader for File {
                 Some(Err(ParquetError::from(e)))
             }
         }
+    }
+
+    fn has_fd(&self) -> bool {
+        true
     }
 }
 

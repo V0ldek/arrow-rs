@@ -71,6 +71,7 @@ sysinfo = { version = "0.31.2", optional = true, default-features = false, featu
 
 ignition = { path = "../../../ignition", features = [], default-features = false }
 ignition-format = { path = "../../../ignition-format" }
+tracing = { version = "0.1.40", features = ["release_max_level_info"] }
 rustix = { version = "0.38.41" }
 memmap2 = { version = "0.9.5" }
 
