@@ -26,7 +26,6 @@ use crate::schema::types::ColumnDescPtr;
 
 static RUNTIME: LazyLock<Result<IgnitionRuntime, RuntimeError>> = LazyLock::new(|| {
     let mut config = ConfigBuilder::new();
-    config.set_worker_thread_limit(1);
     // config.compile_with_debug(true); // debug mode!
     // config.enable_opentelemetry(true);
     // config.validate_utf8(false);
@@ -284,7 +283,7 @@ where
                         let wasm = Vec::from(slice);
                         let bundle = IgnitionBundle::new_extension_from_bytes(wasm, Some(fd), (&schema).into())?;
 
-                        let params = ignition::IgnitionJobParameters::new(&bundle)?;
+                        let params = ignition::IgnitionJobParametersBuilder::new().finish(&bundle)?;
                         let job = self.runtime.init_blocking_job(params)?;
 
                         self.job_bundle = Some(HashedIgnitionJob {
@@ -301,7 +300,8 @@ where
                         let wasm = Vec::from(slice);
                         let bundle = IgnitionBundle::new_extension_from_bytes(wasm, Some(fd), (&schema).into())?;
 
-                        let params = ignition::IgnitionJobParameters::new(&bundle)?;
+
+                        let params = ignition::IgnitionJobParametersBuilder::new().finish(&bundle)?;
 
                         // todo: fails here, let's actually use an ExtensionOwned
                         let job = self.runtime.init_blocking_job(params)?;

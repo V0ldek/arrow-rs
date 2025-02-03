@@ -447,7 +447,6 @@ pub struct IgnitionDecoder<T: DataType> {
 impl<T: DataType> IgnitionDecoder<T> {
     pub fn new(version: String, column_desc: ColumnDescPtr) -> Result<Self> {
         let mut config = ConfigBuilder::new();
-        config.set_worker_thread_limit(1);
         let config = config.into_config();
         let runtime = ignition::build_engine(config)?;
 
@@ -548,7 +547,7 @@ impl<T: DataType> Decoder<T> for IgnitionDecoder<T> {
         bundle.set_dataset_map(data_map);
 
 
-        let params = ignition::IgnitionJobParameters::new(&bundle)?;
+        let params = ignition::IgnitionJobParametersBuilder::new().finish(&bundle)?;
         let mut job = self.runtime.init_blocking_job(params)?;
 
         let ign_record_batch = self.runtime.run_blocking_job(&mut job, 0, self.num_values)?;
