@@ -29,6 +29,7 @@ static RUNTIME: LazyLock<Result<IgnitionRuntime, RuntimeError>> = LazyLock::new(
     // config.compile_with_debug(true); // debug mode!
     // config.enable_opentelemetry(true);
     // config.validate_utf8(false);
+    config.set_thread_virtual_memory_limit(24 * ignition::units::GIB);
     let config = config.into_config();
     let runtime = ignition::build_engine(config);
 
@@ -326,17 +327,18 @@ where
 
                     // todo, only decode what we need here
 
+                    // dbg!(offset);
                     // run natively for perf debug
                     // let schema = Schema::new(vec![Field::new("ignition_col", self.data_type.clone(), false)]);
                     // // let mut native_job = self.runtime.init_native_job("rle_linestatus_paged", (&schema).into())?;
-                    // let mut native_job = self.runtime.init_native_job("fsst_single_column_paged", (&schema).into())?;
+                    // let mut native_job = self.runtime.init_native_job("fsst_single_column_paged", (&schema).into(), true)?;
                     // let fd = match &job.bundle {
                     //     IgnitionBundle::ExtensionOwned(_, fd, _) => { fd.map }
                     //     _ => {
                     //         panic!();
                     //     }
                     // };
-                    //
+
                     // let data_bytes = unsafe { slice::from_raw_parts(fd.as_ptr().add(offset), length) };
                     // let ign_record_batch = self.runtime.run_native_job(&mut native_job, data_bytes, 0, num_rows as usize)?;
 
