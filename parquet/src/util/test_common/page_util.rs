@@ -206,6 +206,7 @@ impl<P: Iterator<Item = Page> + Send> PageReader for InMemoryPageReader<P> {
                     num_levels: None,
                     is_dict: true,
                 })),
+                _ => unimplemented!()
             }
         } else {
             Ok(None)
