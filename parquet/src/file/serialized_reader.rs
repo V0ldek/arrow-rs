@@ -282,8 +282,8 @@ impl<R: 'static + ChunkReader> FileReader for SerializedFileReader<R> {
         RowIter::from_file(projection, self)
     }
 
-    fn get_file_fd(&self) -> Option<Result<ignition::bundle::MappedFd>> {
-        self.chunk_reader.get_fd()
+    fn get_file_fd(&self) -> Option<Result<BorrowedFd>> {
+        self.chunk_reader.get_borrowed_fd()
     }
 }
 
@@ -432,16 +432,16 @@ fn try_decode_mapped_page(page_header: PageHeader, physical_type: Type, file_off
                 statistics: statistics::from_thrift(physical_type, header.statistics)?,
             }))
         },
-        PageType::DECODER_PAGE => {
-            let header = page_header.decoder_page_header.ok_or_else(|| {
-                ParquetError::General("Missing decoder data page header".to_string())
-            })?;
-            Ok(Some(Page::MappedDecoderPage {
-                byte_offset: offset,
-                byte_len: data_len,
-                version: header.version,
-            }))
-        }
+        // PageType::DECODER_PAGE => {
+        //     let header = page_header.decoder_page_header.ok_or_else(|| {
+        //         ParquetError::General("Missing decoder data page header".to_string())
+        //     })?;
+        //     Ok(Some(Page::MappedDecoderPage {
+        //         byte_offset: offset,
+        //         byte_len: data_len,
+        //         version: header.version,
+        //     }))
+        // }
         _ => {
             // We only handle mapped pages
             Ok(None)

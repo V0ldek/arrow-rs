@@ -23,8 +23,10 @@ use bytes::{Buf, Bytes};
 use std::fs::File;
 use std::io::{BufReader, Error, Seek, SeekFrom};
 use std::{io::Read, sync::Arc};
-use std::os::fd::{AsFd, AsRawFd};
-use ignition::bundle::MappedFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use memmap2::Mmap;
+use zstd::zstd_safe::WriteBuf;
+pub use ignition::bundle::MappedFd;
 use crate::bloom_filter::Sbbf;
 use crate::column::page::PageIterator;
 use crate::column::{page::PageReader, reader::ColumnReader};
@@ -69,29 +71,24 @@ pub trait ChunkReader: Length + Send + Sync {
 
     /// Hack to get mapped version of file for ignition
     /// returns None if no valid fd
-    fn get_fd(&self) -> Option<Result<ignition::bundle::MappedFd>> {
+    fn get_borrowed_fd(&self) -> Option<Result<BorrowedFd>> {
         None
     }
 
-    /// avoid calling get_fd, which clones fd
+    /// avoid calling get_borrowed_fd, which clones fd
     fn has_fd(&self) -> bool {
         false
     }
 }
 
-impl Length for File {
-    fn len(&self) -> u64 {
-        self.metadata().map(|m| m.len()).unwrap_or(0u64)
-    }
-}
-
 impl Length for MappedFd {
     fn len(&self) -> u64 {
-        self.map.len() as u64
+        self.map.len() as _
     }
 }
 
 impl ChunkReader for MappedFd {
+    // hack
     type T = &'static [u8];
 
     fn get_read(&self, start: u64) -> Result<Self::T> {
@@ -99,17 +96,31 @@ impl ChunkReader for MappedFd {
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes> {
-        let mut buffer = Vec::with_capacity(length);
+        let b = &self.map[start as usize..start as usize + length];
 
-        let start = start as usize;
-        buffer.copy_from_slice(&self.map[start..start + length]);
+        if b.len() < length {
+            return Err(eof_err!(
+                "Expected to have {} bytes in mmap, had only {}",
+                length,
+                b.len()
+            ));
+        }
 
-        Ok(buffer.into())
+        Ok(Bytes::from(b))
     }
 
-    fn get_fd(&self) -> Option<Result<MappedFd>> {
-        // Some(Ok(self))
-        unimplemented!()
+    fn get_borrowed_fd(&self) -> Option<Result<BorrowedFd>> {
+        Some(Ok(self.fd.as_fd()))
+    }
+
+    fn has_fd(&self) -> bool {
+        true
+    }
+}
+
+impl Length for File {
+    fn len(&self) -> u64 {
+        self.metadata().map(|m| m.len()).unwrap_or(0u64)
     }
 }
 
@@ -136,20 +147,6 @@ impl ChunkReader for File {
             ));
         }
         Ok(buffer.into())
-    }
-
-    /// issue with this is that we are still copying data out
-    /// and mapping into a different version.
-    fn get_fd(&self) -> Option<Result<ignition::bundle::MappedFd>> {
-        let fd = MappedFd::map(self, self.len() as usize);
-        match fd {
-            Ok(fd) => {
-                Some(Ok(fd))
-            }
-            Err(e) => {
-                Some(Err(ParquetError::from(e)))
-            }
-        }
     }
 
     fn has_fd(&self) -> bool {
@@ -202,7 +199,7 @@ pub trait FileReader: Send + Sync {
 
     /// hack to get the fd to ignition
     /// returns None if no valid fd
-    fn get_file_fd(&self) -> Option<Result<ignition::bundle::MappedFd>> {
+    fn get_file_fd(&self) -> Option<Result<BorrowedFd>> {
         None
     }
 }

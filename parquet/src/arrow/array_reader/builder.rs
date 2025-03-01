@@ -22,12 +22,12 @@ use arrow_schema::{DataType, Fields, SchemaBuilder};
 use crate::arrow::array_reader::byte_view_array::make_byte_view_array_reader;
 use crate::arrow::array_reader::empty_array::make_empty_array_reader;
 use crate::arrow::array_reader::fixed_len_byte_array::make_fixed_len_byte_array_reader;
+use crate::arrow::array_reader::primitive_array_ignition::PrimitiveArrayIgnitionReader;
 use crate::arrow::array_reader::{
     make_byte_array_dictionary_reader, make_byte_array_reader, ArrayReader,
     FixedSizeListArrayReader, ListArrayReader, MapArrayReader, NullArrayReader,
     PrimitiveArrayReader, RowGroups, StructArrayReader,
 };
-use crate::arrow::array_reader::primitive_array_ignition::PrimitiveArrayIgnitionReader;
 use crate::arrow::schema::{ParquetField, ParquetFieldType};
 use crate::arrow::ProjectionMask;
 use crate::basic::{Encoding, Type as PhysicalType};
@@ -247,15 +247,24 @@ fn build_primitive_reader(
     // ReaderPageIterator is concrete type
     // dbg!(page_iterator);
     // use a fresh page iterator here
-    let pr = row_groups.column_chunks(col_idx)?.next();
-    let mut pr = pr.unwrap()?;
-    let page = pr.get_next_page()?;
-    let page = page.unwrap();
+    let mut pr = row_groups
+        .column_chunks(col_idx)?
+        .next()
+        .ok_or(general_err!(format!(
+            "Expected column {col_idx} to contain at least 1 column chunk"
+        )))??;
+    let page = pr.get_next_page()?.ok_or(general_err!(format!(
+        "Expected column {col_idx} to contain at least 1 page"
+    )))?;
 
     // if we see a DecoderPage, we know this is an Ignition Column
     // if we see a MappedDecoderPage, we know we are handling the column via mmap, not decoder.
-    if let Page::MappedDecoderPage { .. } = page {
-        assert_eq!(page.encoding(), Encoding::PLAIN, "Ignition decoders should be plain encoded");
+    if let Page::DecoderPage { .. } = page {
+        assert_eq!(
+            page.encoding(),
+            Encoding::PLAIN,
+            "Ignition decoders should be plain encoded"
+        );
         // for our specific case
         // assert_eq!(physical_type, PhysicalType::INT32);
         // assert_eq!(arrow_type, Some(DataType::UInt8));

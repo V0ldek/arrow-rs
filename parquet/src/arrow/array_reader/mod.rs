@@ -113,7 +113,7 @@ pub trait RowGroups {
 
     /// hack to get the file's fd to ignition decoder
     /// returns None if no valid fd
-    fn file_fd(&self) ->  Option<Result<ignition::bundle::MappedFd>> {
+    fn file_fd(&self) -> Option<Result<std::os::fd::BorrowedFd>> {
         None
     }
 }
@@ -128,7 +128,7 @@ impl RowGroups for Arc<dyn FileReader> {
         Ok(Box::new(iterator))
     }
 
-    fn file_fd(&self) -> Option<Result<ignition::bundle::MappedFd>> {
+    fn file_fd(&self) -> Option<Result<std::os::fd::BorrowedFd>> {
         self.get_file_fd()
     }
 }

@@ -669,8 +669,8 @@ impl<T: ChunkReader + 'static> RowGroups for ReaderRowGroups<T> {
         }))
     }
 
-    fn file_fd(&self) -> Option<Result<MappedFd>> {
-        self.reader.get_fd()
+    fn file_fd(&self) -> Option<Result<std::os::fd::BorrowedFd>> {
+        self.reader.get_borrowed_fd()
     }
 }
 

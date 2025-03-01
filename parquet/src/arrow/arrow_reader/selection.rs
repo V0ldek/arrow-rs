@@ -48,6 +48,15 @@ impl RowSelector {
             skip: true,
         }
     }
+
+    pub fn is_select(&self) -> bool {
+        !self.skip
+    }
+
+    pub fn is_skip(&self) -> bool {
+        self.skip
+    }
+
 }
 
 /// [`RowSelection`] allows selecting or skipping a provided number of rows

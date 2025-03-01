@@ -549,14 +549,17 @@ where
                         }
                         Page::DecoderPage { buf, version } => {
                             // which impls of ColumnValueDecoder need to be implemented?
-                            self.values_decoder.set_ignition_decoder(buf, version, Encoding::PLAIN)?;
+                            // the primitive_array_ignition ArrayReader will handle decoding.
+
+                            // if we are using an "Encoding" decoder, we need to pass this on to our decoder
+                            // self.values_decoder.set_ignition_decoder(buf, version, Encoding::PLAIN)?;
                             continue;
                         },
-                        Page::MappedDecoderPage { .. } => {
-                            // since we are dealing with mapped pages here,
-                            // the primitive_array_ignition ArrayReader will handle decoding.
-                            continue;
-                        }
+                        // Page::MappedDecoderPage { .. } => {
+                        //     // since we are dealing with mapped pages here,
+                        //     // the primitive_array_ignition ArrayReader will handle decoding.
+                        //     continue;
+                        // }
                         Page::MappedDataPageV2 { .. } => {
                             // since we are dealing with mapped pages here,
                             // the primitive_array_ignition ArrayReader will handle decoding.
