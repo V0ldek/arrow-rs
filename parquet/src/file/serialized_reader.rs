@@ -282,7 +282,7 @@ impl<R: 'static + ChunkReader> FileReader for SerializedFileReader<R> {
         RowIter::from_file(projection, self)
     }
 
-    fn get_file_fd(&self) -> Option<Result<BorrowedFd>> {
+    fn get_file_fd(&self) -> Option<Result<std::os::fd::BorrowedFd>> {
         self.chunk_reader.get_borrowed_fd()
     }
 }
