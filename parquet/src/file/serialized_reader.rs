@@ -419,6 +419,13 @@ fn try_decode_mapped_page(page_header: PageHeader, physical_type: Type, file_off
             }
 
             let is_compressed = header.is_compressed.unwrap_or(true);
+
+            // we do not support compressed ignition pages for now.
+            // if we want to, we would need to make sure to decompress into a memfd.
+            if is_compressed {
+                return Ok(None);
+            }
+
             Ok(Some(Page::MappedDataPageV2 {
                 byte_offset: offset,
                 byte_len: data_len,
@@ -691,9 +698,8 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
                     }
 
                     // if we are reading a mapped file, we can instead return the mapped variant of the pages
-                    // we could implement a MappedSerializedPageReader to avoid having to check this
-                    if self.reader.has_fd() && self.decompressor.is_none() {
-                        assert!(self.decompressor.is_none(), "mapped file doesn't support compression");
+                    // another option would be to create a Bytes using from_owner which is actually a memfd.
+                    if self.reader.has_fd() {
                         if let Some(page) = try_decode_mapped_page(header.clone(), self.physical_type, *offset - data_len, data_len)? {
                             return Ok(Some(page));
                         }

@@ -26,6 +26,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::slice;
 use std::sync::LazyLock;
+use std::time::Instant;
 
 static RUNTIME: LazyLock<Result<IgnitionRuntime, RuntimeError>> = LazyLock::new(|| {
     let mut config = ConfigBuilder::new();
@@ -247,7 +248,9 @@ impl PrimitiveArrayIgnitionReader {
         let params = ignition::IgnitionJobParametersBuilder::new()
             // .do_not_validate_utf8()
             .finish(&bundle)?;
+        // let s = Instant::now();
         let job = self.runtime.init_blocking_job(params)?;
+        // println!("init_blocking_job took: {}ms", s.elapsed().as_millis());
 
         self.job_bundle = Some(HashedIgnitionJob { hash, job, bundle });
 

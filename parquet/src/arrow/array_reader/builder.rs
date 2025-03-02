@@ -253,6 +253,8 @@ fn build_primitive_reader(
         .ok_or(general_err!(format!(
             "Expected column {col_idx} to contain at least 1 column chunk"
         )))??;
+
+    // unfortunately this triggers a decompression of the decoder page if we have compressed decoder pages
     let page = pr.get_next_page()?.ok_or(general_err!(format!(
         "Expected column {col_idx} to contain at least 1 page"
     )))?;
@@ -265,9 +267,6 @@ fn build_primitive_reader(
             Encoding::PLAIN,
             "Ignition decoders should be plain encoded"
         );
-        // for our specific case
-        // assert_eq!(physical_type, PhysicalType::INT32);
-        // assert_eq!(arrow_type, Some(DataType::UInt8));
 
         let reader = Box::new(PrimitiveArrayIgnitionReader::new(
             row_groups,

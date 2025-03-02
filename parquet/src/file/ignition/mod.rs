@@ -139,7 +139,7 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
             num_rows: num_values,
             def_levels_byte_len: 0,
             rep_levels_byte_len: 0,
-            is_compressed: true,
+            is_compressed: false, // this refers to parquet's builtin compression
             statistics: Some(statistics),
         };
         let compressed_page = CompressedPage::new(page, uncompressed_len);
