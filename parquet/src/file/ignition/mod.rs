@@ -83,6 +83,7 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
         let buf = if let Some(ref mut cmpr) = self.compressor {
             let mut compressed_buf = Vec::with_capacity(uncompressed_size);
             cmpr.compress(decoder_bytes, &mut compressed_buf)?;
+            println!("writing compressed decoder. Original size: {}, compressed size: {}", uncompressed_size, compressed_buf.len());
             compressed_buf.into()
         } else {
             Bytes::copy_from_slice(decoder_bytes)
@@ -101,6 +102,7 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
         Ok(())
     }
 
+    /// uncompressed_len here refers to the size of page_data
     pub fn write_data_page(
         &mut self,
         page_data: &[u8],
@@ -110,8 +112,22 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
         num_values: u32,
         num_distinct: Option<u64>,
         uncompressed_len: usize,
+        parquet_double_compress: bool,
     ) -> Result<()> {
-        let buf = Bytes::copy_from_slice(page_data);
+        assert_eq!(page_data.len(), uncompressed_len);
+
+        // this uses parquet compression ON TOP of the existing ignition buffer
+        let buf = if parquet_double_compress {
+            if let Some(ref mut cmpr) = self.compressor {
+                let mut compressed_buf = Vec::with_capacity(uncompressed_len);
+                cmpr.compress(page_data, &mut compressed_buf)?;
+                compressed_buf.into()
+            } else {
+                panic!("parquet_double_compress was true, but column does not have compressor");
+            }
+        } else {
+            Bytes::copy_from_slice(page_data)
+        };
 
         self.column_metrics.total_rows_written += u64::from(num_values);
         self.column_metrics.num_column_nulls += u64::from(num_nulls);
@@ -139,7 +155,7 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
             num_rows: num_values,
             def_levels_byte_len: 0,
             rep_levels_byte_len: 0,
-            is_compressed: false, // this refers to parquet's builtin compression
+            is_compressed: parquet_double_compress, // this refers to parquet's builtin compression
             statistics: Some(statistics),
         };
         let compressed_page = CompressedPage::new(page, uncompressed_len);

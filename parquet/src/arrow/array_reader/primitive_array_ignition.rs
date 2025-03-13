@@ -1,32 +1,31 @@
-use crate::arrow::array_reader::primitive_array::IntoBuffer;
-use crate::arrow::array_reader::{read_records, ArrayReader, PrimitiveArrayReader, RowGroups};
+use crate::arrow::array_reader::{ArrayReader, RowGroups};
 use crate::arrow::arrow_reader::RowSelector;
-use crate::arrow::record_reader::RecordReader;
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::Encoding;
 use crate::column::page::{Page, PageIterator, PageReader};
 use crate::column::writer::encoder::ColumnValues;
-use crate::data_type::ByteArray;
 use crate::errors::ParquetError;
-use crate::file::reader::RowGroupReader;
+use crate::file::reader::{Length, RowGroupReader};
 use crate::schema::types::ColumnDescPtr;
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Int8Type, UInt8Type};
-use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, StringArray};
-use arrow_buffer::{Buffer, ToByteSlice};
+use arrow_array::{Array, ArrayRef};
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::ArrayData;
-use arrow_schema::{ArrowError, DataType as ArrowType, Field, Schema, TimeUnit};
+use arrow_schema::{ArrowError, DataType as ArrowType, Field, Schema};
 use bytes::Bytes;
 use ignition::bundle::{IgnitionBundle, MappedFd};
 use ignition::config::ConfigBuilder;
-use ignition::{row, IgnitionJob, IgnitionRuntime, RuntimeError};
+use ignition::{IgnitionJob, IgnitionRecordBatch, IgnitionRuntime, RuntimeError};
 use std::any::Any;
-use std::cell::OnceCell;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::slice;
-use std::sync::LazyLock;
-use std::time::Instant;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::{mem, slice};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::{Arc, LazyLock};
+use ahash::AHasher;
+use brotli::enc::static_dict::Hash;
+use rustix::mm::{MapFlags, ProtFlags};
+use crate::basic::ConvertedType::NONE;
 
 static RUNTIME: LazyLock<Result<IgnitionRuntime, RuntimeError>> = LazyLock::new(|| {
     let mut config = ConfigBuilder::new();
@@ -76,6 +75,11 @@ enum IgnitionPage {
         length: usize,
         num_rows: u32,
     },
+    MemFdData {
+        buffer: Bytes,
+        num_rows: u32,
+        fd: OwnedFd,
+    }
 }
 
 impl PrimitiveArrayIgnitionReader {
@@ -102,6 +106,9 @@ impl PrimitiveArrayIgnitionReader {
                 return Err(ParquetError::External(Box::new(e)));
             }
         };
+
+        // benchmark purposes: clear cache
+        // runtime.clear_program_cache();
 
         let fd = row_groups.file_fd().ok_or_else(|| {
             return general_err!("RowGroups should be a mapped file");
@@ -132,6 +139,10 @@ impl PrimitiveArrayIgnitionReader {
             total_rows_read_or_skipped: 0,
             total_num_rows: row_groups.num_rows(),
         })
+    }
+
+    fn nullable(&self) -> bool {
+        self.column_desc.max_def_level() > 0
     }
 
     /// gets the next parquet ignition page. Advances row group if needed.
@@ -175,7 +186,31 @@ impl PrimitiveArrayIgnitionReader {
                     is_compressed,
                     statistics,
                 } => {
-                    return Err(general_err!("DataPageV2 seen, expected MappedDataPageV2"));
+                    // here, we handle compressed datav2 pages, which means the pages are in a memfd
+                    assert_eq!(encoding, Encoding::IGNITION);
+                    assert_eq!(def_levels_byte_len, 0);
+                    assert_eq!(rep_levels_byte_len, 0);
+                    assert_eq!(num_rows, num_values);
+                    assert_eq!(is_compressed, true, "we should only revert to using memfd if the data page is compressed");
+
+                    let fd = ignition::bundle::mapped_fd_from_index(buf.as_ref());
+
+                    let fd = match fd {
+                        None => {
+                            return Err(general_err!("DataPageV2, but did not find Memfd in Memfd index"));
+                        }
+                        Some(fd) => {
+                            fd
+                        }
+                    };
+
+                    return Ok(Some(IgnitionPage::MemFdData {
+                        buffer: buf,
+                        num_rows,
+                        fd,
+                    }));
+
+                    // return Err(general_err!("DataPageV2 seen, expected MappedDataPageV2"));
                 }
                 // Page::MappedDecoderPage {
                 //     byte_offset,
@@ -205,6 +240,7 @@ impl PrimitiveArrayIgnitionReader {
                     assert_eq!(def_levels_byte_len, 0);
                     assert_eq!(rep_levels_byte_len, 0);
                     assert_eq!(num_rows, num_values);
+                    assert_eq!(is_compressed, false);
 
                     return Ok(Some(IgnitionPage::Data {
                         offset: byte_offset,
@@ -240,7 +276,7 @@ impl PrimitiveArrayIgnitionReader {
         let schema = Schema::new(vec![Field::new(
             "ignition_col",
             self.data_type.clone(),
-            false,
+            self.nullable(),
         )]);
 
         let wasm = Vec::from(decoder);
@@ -277,7 +313,7 @@ impl PrimitiveArrayIgnitionReader {
         let schema = Schema::new(vec![Field::new(
             "ignition_col",
             self.data_type.clone(),
-            false,
+            self.nullable(),
         )]);
         // let mut native_job = self.runtime.init_native_job("rle_linestatus_paged", (&schema).into())?;
         let mut native_job =
@@ -299,7 +335,7 @@ impl PrimitiveArrayIgnitionReader {
         // dbg!(ign_record_batch.row_count(), ign_record_batch.null_count());
         assert_eq!(ign_record_batch.row_count(), num_to_read);
 
-        let nullable = self.column_desc.max_def_level() > 0;
+        let nullable = self.nullable();
         let field = Field::new(self.column_desc.name(), self.data_type.clone(), nullable);
         let schema = Schema::new(vec![std::sync::Arc::new(field)]);
 
@@ -318,23 +354,26 @@ impl PrimitiveArrayIgnitionReader {
     }
 
     /// decodes and clones out the decoded array returned from ignition
-    fn decode_batch(
+    /// if Job is None, uses the job in self.job_bundle
+    fn decode_batch_with_job(
         &mut self,
+        job: Option<&mut IgnitionJob>,
         start_tuple: usize,
         num_to_read: usize,
-        offset: usize,
-        length: usize,
     ) -> crate::errors::Result<ArrayRef> {
         // println!("decoding batch for: {}", self.column_desc.name());
 
-        let mut job = match &mut self.job_bundle {
-            Some(job) => &mut job.job,
+        let job = match job {
             None => {
-                return Err(general_err!("Ignition decoder not initialized"));
+                match &mut self.job_bundle {
+                    Some(job) => &mut job.job,
+                    None => {
+                        return Err(general_err!("Ignition decoder not initialized"));
+                    }
+                }
             }
+            Some(job) => job,
         };
-
-        job.force_offset_range(offset as _, length as _);
 
         let ign_record_batch = self
             .runtime
@@ -342,7 +381,7 @@ impl PrimitiveArrayIgnitionReader {
         // dbg!(ign_record_batch.row_count(), ign_record_batch.null_count());
         assert_eq!(ign_record_batch.row_count(), num_to_read);
 
-        let nullable = self.column_desc.max_def_level() > 0;
+        let nullable = self.nullable();
         let field = Field::new(self.column_desc.name(), self.data_type.clone(), nullable);
         let schema = Schema::new(vec![std::sync::Arc::new(field)]);
 
@@ -358,6 +397,41 @@ impl PrimitiveArrayIgnitionReader {
         assert_eq!(decoded.len(), num_to_read);
 
         Ok(decoded)
+    }
+
+    /// Handles the decoding of a job and updates the given output array and selection accordingly
+    /// if Job is None, uses the job in self.job_bundle
+    fn decode_into_array_with_selection(&mut self, array: &mut ArrayRef, selection: &mut RowSelector, num_rows: u32, job: Option<&mut IgnitionJob>) -> Result<(), ParquetError> {
+        // decode the incoming data using the current bundle
+        assert!(self.skip_front_of_next_decoded_page < num_rows as _);
+        let start_tuple = self.skip_front_of_next_decoded_page;
+        let num_to_read = num_rows as usize - start_tuple;
+        self.skip_front_of_next_decoded_page = 0;
+
+        let decoded = self.decode_batch_with_job(job, 0, num_rows as _)?;
+
+        // dbg!(start_tuple, num_to_read, self.skip_front);
+        // let decoded = self.decode_batch_native(start_tuple, num_to_read, offset, length)?;
+        // let decoded = self.decode_batch(0, num_rows as _, offset, length)?;
+
+        // this avoids issues with decoders which break with non-zero start_tuple
+        let decoded = decoded.slice(start_tuple, num_to_read);
+
+        // copy selection rows into output
+        if selection.row_count >= num_to_read {
+            // todo: this is very hot, so we can maybe store all the intermediate vecs
+            // todo: before, and just concat it once
+            *array = arrow_select::concat::concat(&[array.as_ref(), decoded.as_ref()])?;
+            selection.row_count -= num_to_read;
+        } else {
+            assert!(selection.row_count < num_to_read);
+            // copy directly into leftovers, handle on next loop iteration
+            assert!(self.leftovers.is_none());
+            self.leftovers = Some(decoded);
+
+            // selection.row_count remains unchanged
+        }
+        Ok(())
     }
 }
 
@@ -471,36 +545,85 @@ impl ArrayReader for PrimitiveArrayIgnitionReader {
                             continue;
                         }
 
-                        // decode the incoming data using the current bundle
-                        assert!(self.skip_front_of_next_decoded_page < num_rows as _);
-                        let start_tuple = self.skip_front_of_next_decoded_page;
-                        let num_to_read = num_rows as usize - start_tuple;
-                        self.skip_front_of_next_decoded_page = 0;
-
-                        // decode
                         assert!(selection.is_select());
-                        // dbg!(start_tuple, num_to_read, self.skip_front);
-                        // let decoded = self.decode_batch_native(start_tuple, num_to_read, offset, length)?;
-                        let decoded = self.decode_batch(0, num_rows as _, offset, length)?;
 
-                        // this avoids issues with decoders which break with non-zero start_tuple
-                        let decoded = decoded.slice(start_tuple, num_to_read);
+                        // set the job up
+                        let mut job = match &mut self.job_bundle {
+                            Some(job) => &mut job.job,
+                            None => {
+                                return Err(general_err!("Ignition decoder not initialized"));
+                            }
+                        };
+                        job.force_offset_range(offset as _, length as _);
 
-                        // copy selection rows into output
-                        if selection.row_count >= num_to_read {
-                            // todo: this is very hot, so we can maybe store all the intermediate vecs
-                            // todo: before, and just concat it once
-                            array =
-                                arrow_select::concat::concat(&[array.as_ref(), decoded.as_ref()])?;
-                            selection.row_count -= num_to_read;
-                        } else {
-                            assert!(selection.row_count < num_to_read);
-                            // copy directly into leftovers, handle on next loop iteration
-                            assert!(self.leftovers.is_none());
-                            self.leftovers = Some(decoded);
+                        // {
+                        //     // debug
+                        //     let fd = match &self.job_bundle.as_ref().unwrap().bundle {
+                        //         // IgnitionBundle::ExtensionOwned(_, fd, _) => fd.map,
+                        //         IgnitionBundle::ExtensionBorrowed(_, fd, _, _) => fd,
+                        //         _ => {
+                        //             panic!();
+                        //         }
+                        //     };
+                        //     let fd = fd.try_clone_to_owned().unwrap();
+                        //     let mut f = File::from(fd);
+                        //     f.seek(SeekFrom::Start(offset as u64)).unwrap();
+                        //     let r= f.bytes().take(length).collect::<Vec<_>>();
+                        //     let data_bytes = r.iter().map(|b| *b.as_ref().unwrap()).collect::<Vec<_>>();
+                        //     let hash = Hash(data_bytes.as_slice());
+                        //     println!("{hash}, {length}");
+                        // }
 
-                            // selection.row_count remains unchanged
+                        self.decode_into_array_with_selection(&mut array, &mut selection, num_rows, None)?;
+                    }
+                    IgnitionPage::MemFdData { buffer, num_rows, fd } => {
+                        // check if we can skip this page
+                        if self.skip_front_of_next_decoded_page >= num_rows as _ {
+                            // println!("skipped page!");
+                            self.skip_front_of_next_decoded_page -= num_rows as usize;
+                            continue;
                         }
+
+                        assert!(selection.is_select());
+
+                        // {
+                        //     // debug
+                        //     let hash = Hash(buffer.iter().as_slice());
+                        //     println!("{hash}, {}", buffer.len());
+                        // }
+
+                        // for this, we want to decode the page using a temporary bundle.
+                        let old_bundle = match &self.job_bundle {
+                            None => {
+                                return Err(general_err!("Job bundle was not seen before MemFdData Data Page"));
+                            }
+                            Some(bundle) => {
+                                &bundle.bundle
+                            }
+                        };
+
+                        let decoder = old_bundle.decoder();
+                        let schema = Schema::new(vec![Field::new(
+                            "ignition_col",
+                            self.data_type.clone(),
+                            self.nullable(),
+                        )]);
+
+                        // todo: make new bundle variant to avoid cloning decoder
+                        // todo: avoid cloning schema, unify with other schema usage
+
+                        // borrowed_fd is only used in the temp bundle. The temp bundle has a shorter lifetime than the OwnedFd
+                        let borrowed_fd: BorrowedFd<'static> = unsafe { mem::transmute(fd.as_fd()) };
+                        let temp_bundle = IgnitionBundle::new_extension_borrowed_fd(Vec::from(decoder), borrowed_fd, buffer.len(), (&schema).into())?;
+
+                        let temp_params = ignition::IgnitionJobParametersBuilder::new()
+                            .finish(&temp_bundle)?;
+                        let mut temp_job = self.runtime.init_blocking_job(temp_params)?;
+
+                        // println!("using tmp job with buffer len: {}", buffer.len());
+
+                        self.decode_into_array_with_selection(&mut array, &mut selection, num_rows, Some(&mut temp_job))?;
+                        drop(temp_bundle);
                     }
                 }
             }
@@ -539,7 +662,8 @@ impl ArrayReader for PrimitiveArrayIgnitionReader {
     }
 }
 
-// recursively clone
+/// We need this in order to copy the data out of the Ignition managed memory.
+/// recursively clone
 fn deep_clone_array(original: &ArrayData) -> Result<ArrayData, ArrowError> {
     let mut buffers = vec![];
     let mut child_data = vec![];
@@ -556,13 +680,23 @@ fn deep_clone_array(original: &ArrayData) -> Result<ArrayData, ArrowError> {
         child_data.push(deep_clone_array(child)?)
     }
 
+    // normal clone would clone an arc
+    let nulls = if let Some(nulls) = original.nulls() {
+        let buffer = nulls.buffer();
+        let buffer = Buffer::from_slice_ref(buffer.as_slice());
+        let bit_len = buffer.len().saturating_mul(8);
+
+        Some(NullBuffer::new(BooleanBuffer::new(buffer, 0, bit_len)))
+    } else {
+        None
+    };
+
     let array_data = ArrayData::builder(original.data_type().clone())
         .len(original.len())
         .offset(original.offset())
         .buffers(buffers)
         .child_data(child_data)
-        // this clone clones an arc
-        .nulls(original.nulls().cloned());
+        .nulls(nulls);
 
     // Safety: ignition has already validated the utf8 when it is returned.
     // Up to 30% of the samples are spent here validating utf8.

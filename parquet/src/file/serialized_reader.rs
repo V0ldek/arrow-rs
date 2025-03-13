@@ -43,6 +43,7 @@ use crate::schema::types::Type as SchemaType;
 use crate::thrift::{TCompactSliceInputProtocol, TSerializable};
 use bytes::Bytes;
 use thrift::protocol::TCompactInputProtocol;
+use ignition::bundle::IndexedMappedFd;
 use crate::format;
 
 impl TryFrom<File> for SerializedFileReader<File> {
@@ -480,10 +481,16 @@ pub(crate) fn decode_page(
         can_decompress = header_v2.is_compressed.unwrap_or(true);
     }
 
+    // for analysis purposes
+    let mut was_decompressed = false;
+    let uncompressed_page_size = buffer.len();
+
     // TODO: page header could be huge because of statistics. We should set a
     // maximum page header size and abort if that is exceeded.
     let buffer = match decompressor {
         Some(decompressor) if can_decompress => {
+            was_decompressed = true;
+
             let uncompressed_size = page_header.uncompressed_page_size as usize;
             let mut decompressed = Vec::with_capacity(uncompressed_size);
             let compressed = &buffer.as_ref()[offset..];
@@ -502,7 +509,19 @@ pub(crate) fn decode_page(
                 ));
             }
 
-            Bytes::from(decompressed)
+            // in an ideal world, we would decompress directly into the MappedFd, but the
+            // decompress interface requires a vec.
+            // let chains feature would help here
+            if let Some(data_v2) = &page_header.data_page_header_v2 {
+                if data_v2.encoding == format::Encoding::IGNITION {
+                    let mapped_fd = IndexedMappedFd::new_memfd(decompressed.len(), Some(decompressed.as_slice()))?;
+                    Bytes::from_owner(mapped_fd)
+                } else {
+                    Bytes::from(decompressed)
+                }
+            } else {
+                Bytes::from(decompressed)
+            }
         }
         _ => buffer,
     };
@@ -554,6 +573,11 @@ pub(crate) fn decode_page(
             let header = page_header.decoder_page_header.ok_or_else(|| {
                 ParquetError::General("Missing decoder data page header".to_string())
             })?;
+
+            if cfg!(debug_assertions) {
+                println!("Saw decoder page with decoder size: {}. Was compressed: {was_decompressed}", uncompressed_page_size);
+            }
+
             Page::DecoderPage {
                 buf: buffer,
                 version: header.version,
