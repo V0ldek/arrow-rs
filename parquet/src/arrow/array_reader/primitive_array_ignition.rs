@@ -33,7 +33,7 @@ static RUNTIME: LazyLock<Result<IgnitionRuntime, RuntimeError>> = LazyLock::new(
     // config.enable_opentelemetry(true);
     config.compile_with_debug(false);
     config.enable_opentelemetry(false);
-    config.set_thread_virtual_memory_limit(5 * 8 * ignition::units::GIB);
+    config.set_thread_virtual_memory_limit(16 * 8 * ignition::units::GIB);
     let config = config.into_config();
     let runtime = ignition::build_engine(config);
 
@@ -63,6 +63,7 @@ struct HashedIgnitionJob {
     hash: u64,
     job: IgnitionJob,
     bundle: IgnitionBundle,
+    version: String,
 }
 
 enum IgnitionPage {
@@ -158,7 +159,14 @@ impl PrimitiveArrayIgnitionReader {
         }
 
         let page_reader = self.cur_page_reader.as_mut().unwrap();
-        if let Some(page) = page_reader.get_next_page()? {
+
+        let page = if let Some(job) = &self.job_bundle {
+            page_reader.get_next_page_unless_decoder_matches(job.version.as_str())?
+        } else {
+            page_reader.get_next_page()?
+        };
+
+        if let Some(page) = page {
             match page {
                 Page::DataPage { .. } => {
                     return Err(general_err!("DataPage found in Ignition encoded column"));
@@ -258,12 +266,14 @@ impl PrimitiveArrayIgnitionReader {
         self.get_next_page()
     }
 
-    fn handle_new_decoder_page(&mut self, decoder: &[u8], _version: String) -> crate::errors::Result<()> {
+    /// hashing is not needed, jit compilation caching is already performed in wasmtime
+    fn handle_new_decoder_page(&mut self, decoder: &[u8], version: String) -> crate::errors::Result<()> {
         // check if a hash matches for our existing ignition job
         // otherwise, make a new ignition job.
-        let mut h = DefaultHasher::new();
-        decoder.hash(&mut h);
-        let hash = h.finish();
+        // let mut h = DefaultHasher::new();
+        // decoder.hash(&mut h);
+        // let hash = h.finish();
+        let hash = 0;
 
         if let Some(hashed_job) = &self.job_bundle {
             if hashed_job.hash == hash {
@@ -288,7 +298,7 @@ impl PrimitiveArrayIgnitionReader {
         let job = self.runtime.init_blocking_job(params)?;
         // println!("init_blocking_job took: {}ms", s.elapsed().as_millis());
 
-        self.job_bundle = Some(HashedIgnitionJob { hash, job, bundle });
+        self.job_bundle = Some(HashedIgnitionJob { hash, job, bundle, version });
 
         Ok(())
     }
@@ -374,6 +384,8 @@ impl PrimitiveArrayIgnitionReader {
             }
             Some(job) => job,
         };
+
+        // dbg!("decoding: {}", self.column_desc.name());
 
         let ign_record_batch = self
             .runtime

@@ -388,6 +388,16 @@ pub trait PageReader: Iterator<Item = Result<Page>> + Send {
     fn at_record_boundary(&mut self) -> Result<bool> {
         Ok(self.peek_next_page()?.is_none())
     }
+
+    fn next_page_is_decoder(&self) -> Result<bool> {
+        unimplemented!();
+    }
+
+    /// same as get_next_page, except if the decoder matches
+    /// this is used to avoid decompressing decoder pages which are the same
+    fn get_next_page_unless_decoder_matches(&mut self, decoder_version: &str) -> Result<Option<Page>> {
+        unimplemented!();
+    }
 }
 
 /// API for writing pages in a column chunk.

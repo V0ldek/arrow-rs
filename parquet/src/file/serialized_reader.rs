@@ -880,6 +880,106 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
             SerializedPageReaderState::Pages { .. } => Ok(true),
         }
     }
+
+    /// basically copied from get_next_page
+    fn get_next_page_unless_decoder_matches(&mut self, decoder_version: &str) -> Result<Option<Page>> {
+        loop {
+            let page = match &mut self.state {
+                SerializedPageReaderState::Values {
+                    offset,
+                    remaining_bytes: remaining,
+                    next_page_header,
+                } => {
+                    if *remaining == 0 {
+                        return Ok(None);
+                    }
+
+                    let mut read = self.reader.get_read(*offset as u64)?;
+                    let header = if let Some(header) = next_page_header.take() {
+                        *header
+                    } else {
+                        let (header_len, header) = read_page_header_len(&mut read)?;
+                        *offset += header_len;
+                        *remaining -= header_len;
+                        header
+                    };
+                    let data_len = header.compressed_page_size as usize;
+                    *offset += data_len;
+                    *remaining -= data_len;
+
+                    if header.type_ == PageType::INDEX_PAGE {
+                        continue;
+                    }
+
+                    // if we are reading a mapped file, we can instead return the mapped variant of the pages
+                    // another option would be to create a Bytes using from_owner which is actually a memfd.
+                    if self.reader.has_fd() {
+                        if let Some(page) = try_decode_mapped_page(header.clone(), self.physical_type, *offset - data_len, data_len)? {
+                            return Ok(Some(page));
+                        }
+                    }
+
+                    let mut buffer = Vec::with_capacity(data_len);
+                    let read = read.take(data_len as u64).read_to_end(&mut buffer)?;
+
+                    if read != data_len {
+                        return Err(eof_err!(
+                            "Expected to read {} bytes of page, read only {}",
+                            data_len,
+                            read
+                        ));
+                    }
+
+                    // handle skip if decoder version matches
+                    if header.type_ == PageType::DECODER_PAGE {
+                        if let Some(decoder_header) = &header.decoder_page_header {
+                            if decoder_header.version == decoder_version {
+                                continue;
+                            }
+                        }
+                    }
+
+                    decode_page(
+                        header,
+                        Bytes::from(buffer),
+                        self.physical_type,
+                        self.decompressor.as_mut(),
+                    )?
+                }
+                SerializedPageReaderState::Pages {
+                    page_locations,
+                    dictionary_page,
+                    ..
+                } => {
+                    let front = match dictionary_page
+                        .take()
+                        .or_else(|| page_locations.pop_front())
+                    {
+                        Some(front) => front,
+                        None => return Ok(None),
+                    };
+
+                    let page_len = front.compressed_page_size as usize;
+
+                    let buffer = self.reader.get_bytes(front.offset as u64, page_len)?;
+
+                    let mut prot = TCompactSliceInputProtocol::new(buffer.as_ref());
+                    let header = PageHeader::read_from_in_protocol(&mut prot)?;
+                    let offset = buffer.len() - prot.as_slice().len();
+
+                    let bytes = buffer.slice(offset..);
+                    decode_page(
+                        header,
+                        bytes,
+                        self.physical_type,
+                        self.decompressor.as_mut(),
+                    )?
+                }
+            };
+
+            return Ok(Some(page));
+        }
+    }
 }
 
 #[cfg(test)]
