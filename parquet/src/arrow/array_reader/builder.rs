@@ -247,35 +247,39 @@ fn build_primitive_reader(
     // ReaderPageIterator is concrete type
     // dbg!(page_iterator);
     // use a fresh page iterator here
-    let mut pr = row_groups
-        .column_chunks(col_idx)?
-        .next()
-        .ok_or(general_err!(format!(
-            "Expected column {col_idx} to contain at least 1 column chunk"
-        )))??;
+    // let mut pr = row_groups
+    //     .column_chunks(col_idx)?
+    //     .next()
+    //     .ok_or(general_err!(format!(
+    //         "Expected column {col_idx} to contain at least 1 column chunk"
+    //     )))??;
 
-    // unfortunately this triggers a decompression of the decoder page if we have compressed decoder pages
-    let page = pr.get_next_page()?.ok_or(general_err!(format!(
+    // this way, we can handle row groups without column chunks
+    if let Some(pr) = row_groups.column_chunks(col_idx)?.next() {
+        let mut pr = pr?;
+        // unfortunately this triggers a decompression of the decoder page if we have compressed decoder pages
+        let page = pr.get_next_page()?.ok_or(general_err!(format!(
         "Expected column {col_idx} to contain at least 1 page"
     )))?;
 
-    // if we see a DecoderPage, we know this is an Ignition Column
-    // if we see a MappedDecoderPage, we know we are handling the column via mmap, not decoder.
-    if let Page::DecoderPage { .. } = page {
-        assert_eq!(
-            page.encoding(),
-            Encoding::PLAIN,
-            "Ignition decoders should be plain encoded"
-        );
+        // if we see a DecoderPage, we know this is an Ignition Column
+        // if we see a MappedDecoderPage, we know we are handling the column via mmap, not decoder.
+        if let Page::DecoderPage { .. } = page {
+            assert_eq!(
+                page.encoding(),
+                Encoding::PLAIN,
+                "Ignition decoders should be plain encoded"
+            );
 
-        let reader = Box::new(PrimitiveArrayIgnitionReader::new(
-            row_groups,
-            page_iterator,
-            column_desc,
-            arrow_type,
-        )?) as _;
+            let reader = Box::new(PrimitiveArrayIgnitionReader::new(
+                row_groups,
+                page_iterator,
+                column_desc,
+                arrow_type,
+            )?) as _;
 
-        return Ok(Some(reader));
+            return Ok(Some(reader));
+        }
     }
 
     let reader = match physical_type {
