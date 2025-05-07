@@ -10,7 +10,7 @@ use crate::schema::types::ColumnDescPtr;
 use arrow_array::{Array, ArrayRef};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::ArrayData;
-use arrow_schema::{ArrowError, DataType as ArrowType, Field, Schema};
+use arrow_schema::{ArrowError, DataType as ArrowType, DataType, Field, Schema};
 use bytes::Bytes;
 use ignition::bundle::{IgnitionBundle, MappedFd};
 use ignition::config::ConfigBuilder;
@@ -26,6 +26,7 @@ use ahash::AHasher;
 use brotli::enc::static_dict::Hash;
 use rustix::mm::{MapFlags, ProtFlags};
 use crate::basic::ConvertedType::NONE;
+use crate::column::reader::decoder::{ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderImpl, LevelDecoder, RepetitionLevelDecoder, RepetitionLevelDecoderImpl};
 
 static RUNTIME: LazyLock<Result<IgnitionRuntime, RuntimeError>> = LazyLock::new(|| {
     let mut config = ConfigBuilder::new();
@@ -50,13 +51,15 @@ pub struct PrimitiveArrayIgnitionReader {
     pages: Box<dyn PageIterator>, // iterates over column chunks (one column chunk per row group)
     cur_page_reader: Option<Box<dyn PageReader>>, // iterates over pages
     column_desc: ColumnDescPtr,
-    def_levels_buffer: Option<Vec<i16>>,
-    rep_levels_buffer: Option<Vec<i16>>,
     leftovers: Option<ArrayRef>,
     row_selection: Vec<RowSelector>,
     skip_front_of_next_decoded_page: usize,
     total_rows_read_or_skipped: usize,
     total_num_rows: usize,
+    def_levels_buffer: Option<Vec<i16>>,
+    rep_levels_buffer: Option<Vec<i16>>,
+    rep_level_decoder: Option<RepetitionLevelDecoderImpl>,
+    def_level_decoder: Option<DefinitionLevelDecoderImpl>,
 }
 
 struct HashedIgnitionJob {
@@ -74,10 +77,14 @@ enum IgnitionPage {
     Data {
         offset: usize,
         length: usize,
+        def_levels_byte_len: usize,
+        rep_levels_byte_len: usize,
         num_rows: u32,
     },
     MemFdData {
         buffer: Bytes,
+        def_levels_byte_len: usize,
+        rep_levels_byte_len: usize,
         num_rows: u32,
         fd: OwnedFd,
     }
@@ -98,6 +105,11 @@ impl PrimitiveArrayIgnitionReader {
                 .data_type()
                 .clone(),
         };
+
+        // let def_levels = (column_desc.max_def_level() > 0)
+        //     .then(|| crate::arrow::record_reader::definition_levels::DefinitionLevelBuffer::new(&desc, crate::arrow::record_reader::packed_null_mask(&desc)));
+        //
+        // let rep_levels = (column_desc.max_rep_level() > 0).then(Vec::new);
 
         // println!("new reader for col: {} with datatype: {}", column_desc.name(), data_type);
 
@@ -123,6 +135,18 @@ impl PrimitiveArrayIgnitionReader {
             return general_err!("Unable to get size of fd: {}", fd.as_raw_fd() as usize);
         })?.st_size as usize;
 
+
+        let rep_level_decoder = if column_desc.max_rep_level() > 0 {
+            Some(RepetitionLevelDecoderImpl::new(column_desc.max_rep_level()))
+        } else {
+            None
+        };
+        let def_level_decoder = if column_desc.max_def_level() > 0 {
+            Some(DefinitionLevelDecoderImpl::new(column_desc.max_def_level()))
+        } else {
+            None
+        };
+
         Ok(Self {
             fd,
             fd_len,
@@ -139,6 +163,8 @@ impl PrimitiveArrayIgnitionReader {
             skip_front_of_next_decoded_page: 0,
             total_rows_read_or_skipped: 0,
             total_num_rows: row_groups.num_rows(),
+            rep_level_decoder,
+            def_level_decoder,
         })
     }
 
@@ -196,8 +222,8 @@ impl PrimitiveArrayIgnitionReader {
                 } => {
                     // here, we handle compressed datav2 pages, which means the pages are in a memfd
                     assert_eq!(encoding, Encoding::IGNITION);
-                    assert_eq!(def_levels_byte_len, 0);
-                    assert_eq!(rep_levels_byte_len, 0);
+                    // assert_eq!(def_levels_byte_len, 0);
+                    // assert_eq!(rep_levels_byte_len, 0);
                     assert_eq!(num_rows, num_values);
                     assert_eq!(is_compressed, true, "we should only revert to using memfd if the data page is compressed");
 
@@ -215,6 +241,8 @@ impl PrimitiveArrayIgnitionReader {
                     return Ok(Some(IgnitionPage::MemFdData {
                         buffer: buf,
                         num_rows,
+                        def_levels_byte_len: def_levels_byte_len as _,
+                        rep_levels_byte_len: rep_levels_byte_len as _,
                         fd,
                     }));
 
@@ -245,14 +273,16 @@ impl PrimitiveArrayIgnitionReader {
                 } => {
                     // store our offset for processing later
                     assert_eq!(encoding, Encoding::IGNITION);
-                    assert_eq!(def_levels_byte_len, 0);
-                    assert_eq!(rep_levels_byte_len, 0);
-                    assert_eq!(num_rows, num_values);
+                    // assert_eq!(def_levels_byte_len, 0);
+                    // assert_eq!(rep_levels_byte_len, 0);
+                    // assert_eq!(num_rows, num_values);
                     assert_eq!(is_compressed, false);
 
                     return Ok(Some(IgnitionPage::Data {
                         offset: byte_offset,
                         length: byte_len,
+                        def_levels_byte_len: def_levels_byte_len as _,
+                        rep_levels_byte_len: rep_levels_byte_len as _,
                         num_rows,
                     }));
                 }
@@ -373,6 +403,10 @@ impl PrimitiveArrayIgnitionReader {
     ) -> crate::errors::Result<ArrayRef> {
         // println!("decoding batch for: {}", self.column_desc.name());
 
+        let nullable = self.nullable();
+        let field = Field::new(self.column_desc.name(), self.data_type.clone(), nullable);
+        let schema = Schema::new(vec![std::sync::Arc::new(field)]);
+
         let job = match job {
             None => {
                 match &mut self.job_bundle {
@@ -387,15 +421,35 @@ impl PrimitiveArrayIgnitionReader {
 
         // dbg!("decoding: {}", self.column_desc.name());
 
+        // let bundle = match job {
+        //     None => {
+        //         match &mut self.job_bundle {
+        //             Some(job) => job,
+        //             None => {
+        //                 return Err(general_err!("Ignition decoder not initialized"));
+        //             }
+        //         }
+        //     }
+        //     Some(job) => panic!("x"),
+        // };
+        // let (fd, len) = match &bundle.bundle {
+        //     IgnitionBundle::ExtensionBorrowed(_, fd, len, _) => (fd, len),
+        //     _ => {
+        //         panic!();
+        //     }
+        // };
+        //
+        // dbg!(self.column_desc.name(), &self.data_type);
+        // let mut native_job = self.runtime.init_native_job("tpch_vortex", &schema, true)?;
+        // let (offset, len) = bundle.job.get_forced_offset_range().unwrap();
+        // let map = MappedFd::map(fd, self.fd_len)?;
+        // let data_bytes = &map.map[offset as _..offset as usize + len as usize];
+        // let ign_record_batch = self.runtime.run_native_job(&mut native_job, data_bytes, start_tuple, num_to_read)?;
         let ign_record_batch = self
             .runtime
             .run_blocking_job(job, start_tuple, num_to_read)?;
         // dbg!(ign_record_batch.row_count(), ign_record_batch.null_count());
         assert_eq!(ign_record_batch.row_count(), num_to_read);
-
-        let nullable = self.nullable();
-        let field = Field::new(self.column_desc.name(), self.data_type.clone(), nullable);
-        let schema = Schema::new(vec![std::sync::Arc::new(field)]);
 
         let record_batch = ign_record_batch.into_arrow_record_batch(std::sync::Arc::new(schema));
         let mut record_batch = record_batch.map_err(|e| RuntimeError::ArrowError(e))?;
@@ -413,7 +467,7 @@ impl PrimitiveArrayIgnitionReader {
 
     /// Handles the decoding of a job and updates the given output array and selection accordingly
     /// if Job is None, uses the job in self.job_bundle
-    fn decode_into_array_with_selection(&mut self, array: &mut ArrayRef, selection: &mut RowSelector, num_rows: u32, job: Option<&mut IgnitionJob>) -> Result<(), ParquetError> {
+    fn decode_into_array_with_selection(&mut self, array: &mut ChunkedArray, selection: &mut RowSelector, num_rows: u32, job: Option<&mut IgnitionJob>) -> Result<(), ParquetError> {
         // decode the incoming data using the current bundle
         assert!(self.skip_front_of_next_decoded_page < num_rows as _);
         let start_tuple = self.skip_front_of_next_decoded_page;
@@ -433,7 +487,8 @@ impl PrimitiveArrayIgnitionReader {
         if selection.row_count >= num_to_read {
             // todo: this is very hot, so we can maybe store all the intermediate vecs
             // todo: before, and just concat it once
-            *array = arrow_select::concat::concat(&[array.as_ref(), decoded.as_ref()])?;
+            array.append(decoded);
+            // *array = arrow_select::concat::concat(&[array.as_ref(), decoded.as_ref()])?;
             selection.row_count -= num_to_read;
         } else {
             assert!(selection.row_count < num_to_read);
@@ -477,8 +532,16 @@ impl ArrayReader for PrimitiveArrayIgnitionReader {
 
     #[tracing::instrument(skip(self))]
     fn consume_batch(&mut self) -> crate::errors::Result<ArrayRef> {
+        if let Some(buf) = &mut self.rep_levels_buffer {
+            buf.clear();
+        }
+        if let Some(buf) = &mut self.def_levels_buffer {
+            buf.clear();
+        }
+
         // dbg!(self.total_rows_read_or_skipped, self.total_num_rows);
-        let mut array = arrow_array::array::new_empty_array(&self.data_type);
+        // let mut array = arrow_array::array::new_empty_array(&self.data_type);
+        let mut array = ChunkedArray::new(&self.data_type);
 
         // drain the entire selection
         let mut row_selection = std::mem::replace(&mut self.row_selection, vec![]);
@@ -487,10 +550,12 @@ impl ArrayReader for PrimitiveArrayIgnitionReader {
             while selection.row_count > 0 {
                 // if we reported leftovers, start with them
                 if let Some(leftovers) = self.leftovers.take() {
+                    let leftover_len = leftovers.len();
                     if leftovers.len() > selection.row_count {
                         if selection.is_select() {
                             let l = leftovers.slice(0, selection.row_count);
-                            array = arrow_select::concat::concat(&[array.as_ref(), l.as_ref()])?;
+                            array.append(l);
+                            // array = arrow_select::concat::concat(&[array.as_ref(), l.as_ref()])?;
                         }
                         // in both cases, we store the remainder back into  leftovers
                         let r = leftovers
@@ -499,21 +564,23 @@ impl ArrayReader for PrimitiveArrayIgnitionReader {
                         selection.row_count = 0;
                     } else if leftovers.len() == selection.row_count {
                         if selection.is_select() {
-                            array = arrow_select::concat::concat(&[
-                                array.as_ref(),
-                                leftovers.as_ref(),
-                            ])?;
+                            array.append(leftovers);
+                            // array = arrow_select::concat::concat(&[
+                            //     array.as_ref(),
+                            //     leftovers.as_ref(),
+                            // ])?;
                         }
                         selection.row_count = 0;
                     } else {
                         assert!(leftovers.len() < selection.row_count);
                         if selection.is_select() {
-                            array = arrow_select::concat::concat(&[
-                                array.as_ref(),
-                                leftovers.as_ref(),
-                            ])?;
+                            array.append(leftovers);
+                            // array = arrow_select::concat::concat(&[
+                            //     array.as_ref(),
+                            //     leftovers.as_ref(),
+                            // ])?;
                         }
-                        selection.row_count -= leftovers.len();
+                        selection.row_count -= leftover_len;
                     }
                 }
 
@@ -548,6 +615,8 @@ impl ArrayReader for PrimitiveArrayIgnitionReader {
                     IgnitionPage::Data {
                         offset,
                         length,
+                        def_levels_byte_len,
+                        rep_levels_byte_len,
                         num_rows,
                     } => {
                         // check if we can skip this page
@@ -566,7 +635,22 @@ impl ArrayReader for PrimitiveArrayIgnitionReader {
                                 return Err(general_err!("Ignition decoder not initialized"));
                             }
                         };
-                        job.force_offset_range(offset as _, length as _);
+
+                        // todo: handle def/rep: we want to use a LevelDecoder directly.
+                        // handle def
+                        // if let Some(def_decoder) = &mut self.def_level_decoder {
+                        //     let buf = vec![];
+                        //     let map = MappedFd::map(self.fd.clone(), self.fd_len)?;
+                        //     let bytes = &map.map[offset..offset+def_levels_byte_len];
+                        //     let bytes = Bytes::from(bytes.to_vec());
+                        //     def_decoder.set_data(Encoding::RLE, bytes);
+                        //
+                        //     def_decoder.read_def_levels();
+                        // }
+
+
+                        let new_offset = offset + def_levels_byte_len + rep_levels_byte_len;
+                        job.force_offset_range(new_offset as _, length as _);
 
                         // {
                         //     // debug
@@ -586,15 +670,17 @@ impl ArrayReader for PrimitiveArrayIgnitionReader {
                         //     println!("{hash}, {length}");
                         // }
 
-                        self.decode_into_array_with_selection(&mut array, &mut selection, num_rows, None)?;
+                        self.decode_into_array_with_selection(&mut array, &mut selection, num_rows, None);
                     }
-                    IgnitionPage::MemFdData { buffer, num_rows, fd } => {
+                    IgnitionPage::MemFdData { buffer, def_levels_byte_len, rep_levels_byte_len, num_rows, fd } => {
                         // check if we can skip this page
                         if self.skip_front_of_next_decoded_page >= num_rows as _ {
                             // println!("skipped page!");
                             self.skip_front_of_next_decoded_page -= num_rows as usize;
                             continue;
                         }
+
+                        // todo: implement def/rep levels here.
 
                         assert!(selection.is_select());
 
@@ -644,7 +730,9 @@ impl ArrayReader for PrimitiveArrayIgnitionReader {
         }
 
         assert!(self.row_selection.is_empty());
-        Ok(array)
+
+        let concat_array = array.concat_clone()?;
+        Ok(concat_array)
     }
 
     fn skip_records(&mut self, mut num_records: usize) -> crate::errors::Result<usize> {
@@ -671,6 +759,38 @@ impl ArrayReader for PrimitiveArrayIgnitionReader {
 
     fn get_rep_levels(&self) -> Option<&[i16]> {
         self.rep_levels_buffer.as_deref()
+    }
+}
+
+
+struct ChunkedArray {
+    arrays: Vec<ArrayRef>,
+}
+
+impl ChunkedArray {
+    fn new(data_type: &DataType) -> Self {
+        let array = arrow_array::array::new_empty_array(data_type);
+
+        Self {
+            arrays: vec![array],
+        }
+    }
+
+    fn tuple_len(&self) -> usize {
+        self.arrays.iter().map(|a| a.len()).sum()
+    }
+
+    fn append(&mut self, array: ArrayRef) {
+        self.arrays.push(array);
+    }
+
+    fn concat_clone(self) -> crate::errors::Result<ArrayRef> {
+        if self.arrays.len() == 1 {
+            Ok(self.arrays[0].clone())
+        } else {
+            let slice = self.arrays.as_slice().iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+            arrow_select::concat::concat(slice.as_slice()).map_err(|e| e.into())
+        }
     }
 }
 

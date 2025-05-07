@@ -52,7 +52,7 @@ use crate::thrift::TSerializable;
 use levels::{calculate_array_levels, ArrayLevels};
 
 mod byte_array;
-mod levels;
+pub mod levels;
 
 /// Encodes [`RecordBatch`] to parquet
 ///
@@ -496,7 +496,7 @@ impl PageWriter for ArrowPageWriter {
 
 /// A leaf column that can be encoded by [`ArrowColumnWriter`]
 #[derive(Debug)]
-pub struct ArrowLeafColumn(ArrayLevels);
+pub struct ArrowLeafColumn(pub ArrayLevels);
 
 /// Computes the [`ArrowLeafColumn`] for a potentially nested [`ArrayRef`]
 pub fn compute_leaves(field: &Field, array: &ArrayRef) -> Result<Vec<ArrowLeafColumn>> {

@@ -398,7 +398,7 @@ fn write_bloom_filters<W: Write + Send>(
 ///   method. THe close method will return row group metadata and is no-op
 ///   on already closed row group.
 pub struct SerializedRowGroupWriter<'a, W: Write> {
-    descr: SchemaDescPtr,
+    pub descr: SchemaDescPtr,
     props: WriterPropertiesPtr,
     buf: &'a mut TrackedWrite<W>,
     total_rows_written: Option<u64>,

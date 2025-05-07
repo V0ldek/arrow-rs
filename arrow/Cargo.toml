@@ -49,7 +49,7 @@ arrow-ipc = { workspace = true, optional = true }
 arrow-json = { workspace = true, optional = true }
 arrow-ord = { workspace = true }
 arrow-row = { workspace = true }
-arrow-schema = { workspace = true }
+arrow-schema = { workspace = true, features = ["serde"] }
 arrow-select = { workspace = true }
 arrow-string = { workspace = true }
 

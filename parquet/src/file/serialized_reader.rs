@@ -574,9 +574,9 @@ pub(crate) fn decode_page(
                 ParquetError::General("Missing decoder data page header".to_string())
             })?;
 
-            if cfg!(debug_assertions) {
-                println!("Saw decoder page with decoder size: {}. Was compressed: {was_decompressed}", uncompressed_page_size);
-            }
+            // if cfg!(debug_assertions) {
+            //     println!("Saw decoder page with decoder size: {}. Was compressed: {was_decompressed}", uncompressed_page_size);
+            // }
 
             Page::DecoderPage {
                 buf: buffer,
@@ -961,11 +961,31 @@ impl<R: ChunkReader> PageReader for SerializedPageReader<R> {
 
                     let page_len = front.compressed_page_size as usize;
 
+                    {
+                        let (header_len, header) = read_page_header_len(&mut self.reader.get_read(front.offset as u64)?)?;
+                        // if we are reading a mapped file, we can instead return the mapped variant of the pages
+                        // another option would be to create a Bytes using from_owner which is actually a memfd.
+                        if self.reader.has_fd() {
+                            if let Some(page) = try_decode_mapped_page(header.clone(), self.physical_type, front.offset as usize + header_len, page_len-header_len)? {
+                                return Ok(Some(page));
+                            }
+                        }
+                    }
+
                     let buffer = self.reader.get_bytes(front.offset as u64, page_len)?;
 
                     let mut prot = TCompactSliceInputProtocol::new(buffer.as_ref());
                     let header = PageHeader::read_from_in_protocol(&mut prot)?;
                     let offset = buffer.len() - prot.as_slice().len();
+
+                    // handle skip if decoder version matches
+                    if header.type_ == PageType::DECODER_PAGE {
+                        if let Some(decoder_header) = &header.decoder_page_header {
+                            if decoder_header.version == decoder_version {
+                                continue;
+                            }
+                        }
+                    }
 
                     let bytes = buffer.slice(offset..);
                     decode_page(

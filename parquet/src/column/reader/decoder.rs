@@ -291,7 +291,7 @@ impl<T: DataType> ColumnValueDecoder for ColumnValueDecoderImpl<T> {
 
 const SKIP_BUFFER_SIZE: usize = 1024;
 
-enum LevelDecoder {
+pub enum LevelDecoder {
     Packed(BitReader, u8),
     Rle(RleDecoder),
 }

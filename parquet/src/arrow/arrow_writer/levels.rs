@@ -50,7 +50,7 @@ use std::sync::Arc;
 
 /// Performs a depth-first scan of the children of `array`, constructing [`ArrayLevels`]
 /// for each leaf column encountered
-pub(crate) fn calculate_array_levels(array: &ArrayRef, field: &Field) -> Result<Vec<ArrayLevels>> {
+pub fn calculate_array_levels(array: &ArrayRef, field: &Field) -> Result<Vec<ArrayLevels>> {
     let mut builder = LevelInfoBuilder::try_new(field, Default::default(), array)?;
     builder.write(0..array.len());
     Ok(builder.finish())
@@ -543,29 +543,29 @@ impl LevelInfoBuilder {
 /// The data necessary to write a primitive Arrow array to parquet, taking into account
 /// any non-primitive parents it may have in the arrow representation
 #[derive(Debug, Clone)]
-pub(crate) struct ArrayLevels {
+pub struct ArrayLevels {
     /// Array's definition levels
     ///
     /// Present if `max_def_level != 0`
-    def_levels: Option<Vec<i16>>,
+    pub def_levels: Option<Vec<i16>>,
 
     /// Array's optional repetition levels
     ///
     /// Present if `max_rep_level != 0`
-    rep_levels: Option<Vec<i16>>,
+    pub rep_levels: Option<Vec<i16>>,
 
     /// The corresponding array identifying non-null slices of data
     /// from the primitive array
     non_null_indices: Vec<usize>,
 
     /// The maximum definition level for this leaf column
-    max_def_level: i16,
+    pub max_def_level: i16,
 
     /// The maximum repetition for this leaf column
-    max_rep_level: i16,
+    pub max_rep_level: i16,
 
     /// The arrow array
-    array: ArrayRef,
+    pub array: ArrayRef,
 }
 
 impl PartialEq for ArrayLevels {

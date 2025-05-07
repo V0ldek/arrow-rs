@@ -185,7 +185,7 @@ pub struct ColumnCloseResult {
 
 // Metrics per page
 #[derive(Default)]
-struct PageMetrics {
+pub struct PageMetrics {
     num_buffered_values: u32,
     num_buffered_rows: u32,
     num_page_nulls: u64,
@@ -225,14 +225,14 @@ impl PageMetrics {
     }
 
     /// Updates histogram values using provided repetition levels
-    fn update_repetition_level_histogram(&mut self, levels: &[i16]) {
+    pub fn update_repetition_level_histogram(&mut self, levels: &[i16]) {
         if let Some(ref mut rep_hist) = self.repetition_level_histogram {
             rep_hist.update_from_levels(levels);
         }
     }
 
     /// Updates histogram values using provided definition levels
-    fn update_definition_level_histogram(&mut self, levels: &[i16]) {
+    pub fn update_definition_level_histogram(&mut self, levels: &[i16]) {
         if let Some(ref mut def_hist) = self.definition_level_histogram {
             def_hist.update_from_levels(levels);
         }

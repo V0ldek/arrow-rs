@@ -1,6 +1,6 @@
 use crate::compression::{self, Codec, CodecOptionsBuilder};
 use crate::format as parquet;
-use crate::format::{ColumnIndex, OffsetIndex};
+use crate::format::{ColumnIndex, DataPageHeaderV2, OffsetIndex};
 use crate::thrift::TSerializable;
 use crate::{basic::Encoding, bloom_filter::Sbbf};
 use crate::{
@@ -11,16 +11,16 @@ use bytes::Bytes;
 use std::fmt::Debug;
 use std::io::{BufWriter, IoSlice, Read};
 use std::{io::Write, sync::Arc};
+use std::collections::BTreeSet;
 use thrift::protocol::TCompactOutputProtocol;
 
-use crate::column::writer::{
-    get_typed_column_writer_mut, ColumnCloseResult, ColumnMetrics, ColumnWriterImpl,
-};
+use crate::column::writer::{get_typed_column_writer_mut, ColumnCloseResult, ColumnMetrics, ColumnWriterImpl, PageMetrics};
 use crate::column::{
     page::{CompressedPage, Page, PageWriteSpec, PageWriter},
     writer::{get_column_writer, ColumnWriter},
 };
-use crate::data_type::DataType;
+use crate::data_type::{AsBytes, DataType};
+use crate::encodings::levels::LevelEncoder;
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{BloomFilterPosition, EnabledStatistics, WriterPropertiesPtr};
 use crate::file::reader::ChunkReader;
@@ -45,6 +45,9 @@ pub struct IgnitionColumnWriter<'a, T: Default, W: Write> {
     compressor: Option<Box<dyn Codec>>,
 
     column_metrics: ColumnMetrics<T>,
+
+    column_index_builder: ColumnIndexBuilder,
+    offset_index_builder: OffsetIndexBuilder,
 }
 
 impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
@@ -58,8 +61,26 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
         let codec_options = CodecOptionsBuilder::default().build();
         let compressor = compression::create_codec(codec, &codec_options).unwrap();
 
+        let mut encodings = BTreeSet::new();
+        // Used for level information
+        encodings.insert(Encoding::RLE);
+
         let statistics_enabled = props.statistics_enabled(column.path());
-        let column_metrics = ColumnMetrics::new();
+        let mut column_metrics = ColumnMetrics::new();
+        // let mut page_metrics = PageMetrics::new();
+
+        // Initialize level histograms if collecting page or chunk statistics
+        if statistics_enabled != EnabledStatistics::None {
+            column_metrics = column_metrics
+                .with_repetition_level_histogram(column.max_rep_level())
+                .with_definition_level_histogram(column.max_def_level())
+        }
+
+        // Disable column_index_builder if not collecting page statistics.
+        let mut column_index_builder = ColumnIndexBuilder::new();
+        if statistics_enabled != EnabledStatistics::Page {
+            column_index_builder.to_invalid()
+        }
 
         Ok(Self {
             descr: column,
@@ -70,6 +91,8 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
             compressor,
             statistics_enabled,
             column_metrics,
+            column_index_builder,
+            offset_index_builder: OffsetIndexBuilder::new(),
         })
     }
 
@@ -78,6 +101,7 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
         decoder_bytes: &[u8],
         version: impl Into<String>,
     ) -> Result<()> {
+        dbg!("write decoder");
         let uncompressed_size = decoder_bytes.len();
 
         let buf = if let Some(ref mut cmpr) = self.compressor {
@@ -106,14 +130,18 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
     pub fn write_data_page(
         &mut self,
         page_data: &[u8],
-        min: Option<T>,
-        max: Option<T>,
+        mut min: Option<T>,
+        mut max: Option<T>,
         num_nulls: u32,
         num_values: u32,
         num_distinct: Option<u64>,
         uncompressed_len: usize,
         parquet_double_compress: bool,
+        page_variable_length_bytes: Option<i64>, // only set for byte array. total length.
+        def_levels: Option<&[i16]>,
+        rep_levels: Option<&[i16]>,
     ) -> Result<()> {
+        // dbg!("write data", num_values);
         assert_eq!(page_data.len(), uncompressed_len);
 
         // this uses parquet compression ON TOP of the existing ignition buffer
@@ -129,8 +157,12 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
             Bytes::copy_from_slice(page_data)
         };
 
-        self.column_metrics.total_rows_written += u64::from(num_values);
-        self.column_metrics.num_column_nulls += u64::from(num_nulls);
+        {
+            // done elsewhere (disable when writing nested?)
+            self.column_metrics.total_rows_written += u64::from(num_values);
+            self.column_metrics.num_column_nulls += u64::from(num_nulls);
+        }
+
         if let Some(page_min) = &min {
             update_min(
                 &self.descr,
@@ -145,13 +177,62 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
                 &mut self.column_metrics.max_column_value,
             );
         }
-        let statistics = Statistics::new(min, max, num_distinct, Some(num_nulls.into()), false);
+
+        let statistics = if self.can_truncate_value() {
+            let mut did_truncate_min = false;
+            let mut did_truncate_max = false;
+            let mut new_min = None;
+            let mut new_max = None;
+
+            if min.is_some() {
+                let (trunc_min, did_truncate_min_new) = truncate_min_value(
+                    self.props.statistics_truncate_length(),
+                    min.as_ref().map(AsBytes::as_bytes).unwrap(),
+                );
+
+                did_truncate_min = did_truncate_min_new;
+                new_min = Some(trunc_min.into());
+            }
+
+            if max.is_some() {
+                let (trunc_max, did_truncate_max_new) = truncate_max_value(
+                    self.props.statistics_truncate_length(),
+                    max.as_ref().map(AsBytes::as_bytes).unwrap(),
+                );
+
+                did_truncate_max = did_truncate_max_new;
+                new_max = Some(trunc_max.into());
+            }
+
+            Statistics::ByteArray(
+                ValueStatistics::new(
+                    new_min,
+                    new_max,
+                    num_distinct,
+                    Some(num_nulls.into()),
+                    false,
+                )
+                    .with_min_is_exact(!did_truncate_max)
+                    .with_max_is_exact(!did_truncate_max),
+            )
+        } else {
+            let vs = ValueStatistics::new(
+                min.clone(),
+                max.clone(),
+                num_distinct,
+                Some(num_nulls.into()),
+                false,
+            );
+            Statistics::from(vs)
+        };
+
 
         let page = Page::DataPageV2 {
             buf,
             num_values,
             encoding: crate::basic::Encoding::IGNITION,
             num_nulls,
+            // num_rows: num_values + num_nulls,
             num_rows: num_values,
             def_levels_byte_len: 0,
             rep_levels_byte_len: 0,
@@ -160,7 +241,97 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
         };
         let compressed_page = CompressedPage::new(page, uncompressed_len);
 
-        let page_spec = self.write_page(compressed_page)?;
+        // this only works for vortex pages
+        let page_spec = self.write_page_aligned(compressed_page, def_levels, rep_levels)?;
+        // let page_spec = self.write_page(compressed_page)?;
+
+        // update column index
+        let null_page = num_values == num_nulls;
+
+        if null_page && self.column_index_builder.valid() {
+            self.column_index_builder.append(
+                null_page,
+                vec![],
+                vec![],
+                num_nulls as _,
+            );
+        } else if self.column_index_builder.valid() {
+            if !(min.is_some() && max.is_some()) {
+                self.column_index_builder.to_invalid();
+            } else {
+                self.column_index_builder.append(
+                    null_page,
+                    min.as_ref().map(|m| AsBytes::as_bytes(m)).unwrap().to_vec(),
+                    max.as_ref().map(|m| AsBytes::as_bytes(m)).unwrap().to_vec(),
+                    num_nulls as _,
+                );
+            }
+        }
+
+        // handle rep/def level
+        if let (Some(def), Some(rep)) = (def_levels, rep_levels) {
+            if def.len() != rep.len() {
+                return Err(general_err!(
+                    "Inconsistent length of definition and repetition levels: {} != {}",
+                    def.len(),
+                    rep.len()
+                ));
+            }
+        }
+        let mut repetition_level_histogram = LevelHistogram::try_new(self.descr.max_rep_level());
+        let mut definition_level_histogram = LevelHistogram::try_new(self.descr.max_def_level());
+
+        // if self.descr.max_def_level() > 0 {
+        //     let levels = def_levels.ok_or_else(|| {
+        //         general_err!(
+        //             "Definition levels are required, because max definition level = {}",
+        //             self.descr.max_def_level()
+        //         )
+        //     })?;
+        //
+        //     if let Some(ref mut def_hist) = definition_level_histogram {
+        //         def_hist.update_from_levels(levels);
+        //     }
+        // }
+
+        if self.descr.max_rep_level() > 0 {
+            // A row could contain more than one value.
+            let levels = rep_levels.ok_or_else(|| {
+                general_err!(
+                    "Repetition levels are required, because max repetition level = {}",
+                    self.descr.max_rep_level()
+                )
+            })?;
+
+            if !levels.is_empty() && levels[0] != 0 {
+                return Err(general_err!(
+                    "Write must start at a record boundary, got non-zero repetition level of {}",
+                    levels[0]
+                ));
+            }
+
+            if let Some(ref mut def_hist) = repetition_level_histogram {
+                def_hist.update_from_levels(levels);
+            }
+        }
+
+        ColumnMetrics::<T>::update_histogram(&mut self.column_metrics.repetition_level_histogram, &repetition_level_histogram);
+        ColumnMetrics::<T>::update_histogram(&mut self.column_metrics.definition_level_histogram, &definition_level_histogram);
+        self.column_index_builder.append_histograms(
+            &repetition_level_histogram,
+            &definition_level_histogram,
+        );
+
+        // Update the offset index
+        self.offset_index_builder
+            .append_row_count(num_values as _);
+
+        self.offset_index_builder
+            .append_unencoded_byte_array_data_bytes(page_variable_length_bytes);
+
+        self.offset_index_builder
+            .append_offset_and_size(page_spec.offset as i64, page_spec.compressed_size as i32);
+
         self.update_metrics_for_page(page_spec);
         Ok(())
     }
@@ -180,6 +351,121 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
         spec.offset = start_pos;
         spec.bytes_written = self.sink.bytes_written() as u64 - start_pos;
         spec.num_values = page.num_values();
+
+        Ok(spec)
+    }
+
+    /// THIS IS FOR THE "VORTEX" PAGED FORMAT with the following format in the page.
+    /// doesn't quite work, because our tracked write is only for this column.
+    /// this assumes we are writing a page with the following format.
+    /// first, rep/def buffers.
+    ///
+    /// first 4 bytes: tuples/chunk u32
+    /// next 4 bytes: start offset of data chunk u32
+    /// next 4 bytes: end offset of data chunk u32
+    /// some padding bytes in order to 8-byte align the data chunk in the file
+    /// data chunk
+    /// what this function will do is make sure start offset is aligned to 4 bytes
+    fn write_page_aligned(&mut self, page: CompressedPage, def_levels: Option<&[i16]>, rep_levels: Option<&[i16]>) -> Result<PageWriteSpec> {
+        fn encode_levels_v2(levels: &[i16], max_level: i16) -> Vec<u8> {
+            let mut encoder = LevelEncoder::v2(max_level, levels.len());
+            encoder.put(levels);
+            encoder.consume()
+        }
+
+        let encoded_def = def_levels.map(|lv| encode_levels_v2(lv, self.descr.max_def_level()));
+        let encoded_rep = rep_levels.map(|lv| encode_levels_v2(lv, self.descr.max_rep_level()));
+        let def_levels_byte_len = encoded_def.as_ref().map(|b| b.len()).unwrap_or(0);
+        let rep_levels_byte_len = encoded_rep.as_ref().map(|b| b.len()).unwrap_or(0);
+        // let uncompressed_size = rep_levels_byte_len + def_levels_byte_len + values_data.buf.len();
+
+        let page_type = page.page_type();
+        let start_pos = self.sink.bytes_written() as u64;
+
+        let mut page_header = page.to_thrift_header();
+
+        // handle the def/rep stuff, plae it at the front.
+        if let DataPageHeaderV2 { definition_levels_byte_length, repetition_levels_byte_length, .. } = page_header.data_page_header_v2.as_mut().unwrap() {
+            *definition_levels_byte_length = def_levels_byte_len as _;
+            *repetition_levels_byte_length = rep_levels_byte_len as _;
+        }
+        page_header.uncompressed_page_size += def_levels_byte_len as i32;
+        page_header.uncompressed_page_size += rep_levels_byte_len as i32;
+
+        if let Some(def) = encoded_def {
+            self.sink.write(def.as_slice())?;
+        }
+        if let Some(rep) = encoded_rep {
+            self.sink.write(rep.as_slice())?;
+        }
+
+
+        // pre-write the header to a buffer because we need the header's size
+        let predicted_header_size = {
+            let mut fake_sink = vec![];
+            let mut tracked_sink = TrackedWrite::new(&mut fake_sink);
+            let mut protocol = TCompactOutputProtocol::new(&mut tracked_sink);
+            page_header.write_to_out_protocol(&mut protocol)?;
+            let header_size = tracked_sink.bytes_written();
+            header_size
+        };
+        let predicted_padding = {
+            let mut cur_pos = self.sink.bytes_written() as u64;
+            cur_pos += predicted_header_size as u64;
+            cur_pos += 4;
+
+            let padding = (8 - (cur_pos % 8)) % 8;
+            padding
+        };
+
+        page_header.compressed_page_size += predicted_padding as i32;
+        // page_header.uncompressed_page_size += predicted_padding as i32;
+
+        let header_size = self.serialize_page_header(page_header.clone())?;
+
+        dbg!(predicted_header_size, header_size);
+        assert_eq!(predicted_header_size, header_size);
+
+        // write the tuples-per-page value (4 bytes)
+        self.sink.write_all(&page.data()[0..4])?;
+
+        self.sink.flush()?;
+
+        // now check to see how we are looking in terms of alignment
+        let mut cur_pos = self.sink.bytes_written() as u64;
+        // cur_pos += std::fs::read("/home/maurice/IdeaProjects/portable-decompress/tmp/tpch/duckdb_snappy/nation.parquet").unwrap().len() as u64;
+        // if we are 8 byte aligned here we are good
+        let padding = (8 - (cur_pos % 8)) % 8;
+        // dbg!(cur_pos, padding);
+
+        // write start
+        let start_offset = (12 + padding) as u32;
+        self.sink.write_all(&start_offset.to_le_bytes())?;
+        // write end
+        let original_end = u32::from_le_bytes(page.data()[8..12].try_into().unwrap());
+        let end = original_end + padding as u32;
+        self.sink.write_all(&end.to_le_bytes())?;
+
+        // dbg!(start_offset, end);
+
+        // now we write the padding
+        let padding_bytes = std::iter::repeat(0).take(padding as usize).collect::<Vec<u8>>();
+        self.sink.write_all(padding_bytes.as_slice())?;
+
+        // now write the data (should be aligned)
+        // assert_eq!((8 - (self.sink.bytes_written() % 8)) % 8, 0);
+        self.sink.write_all(&page.data()[12..])?;
+
+        // handle rest
+        let mut spec = PageWriteSpec::new();
+        spec.page_type = page_type;
+        spec.uncompressed_size = page.uncompressed_size() + header_size + padding as usize;
+        spec.compressed_size = page.compressed_size() + header_size + padding as usize;
+        spec.offset = start_pos;
+        spec.bytes_written = self.sink.bytes_written() as u64 - start_pos;
+        spec.num_values = page.num_values();
+
+        dbg!(&spec.num_values);
 
         Ok(spec)
     }
@@ -231,13 +517,19 @@ impl<'a, T: ParquetValueType, W: Write> IgnitionColumnWriter<'a, T, W> {
         let metadata = self.build_column_metadata()?;
         self.sink.flush()?;
 
+        let column_index = self
+            .column_index_builder
+            .valid()
+            .then(|| self.column_index_builder.build_to_thrift());
+        let offset_index = Some(self.offset_index_builder.build_to_thrift());
+
         let result = ColumnCloseResult {
             bytes_written: self.column_metrics.total_bytes_written,
             rows_written: self.column_metrics.total_rows_written,
             bloom_filter,
             metadata,
-            column_index: None,
-            offset_index: None,
+            column_index,
+            offset_index,
         };
 
         (self.on_close)(result)?;
